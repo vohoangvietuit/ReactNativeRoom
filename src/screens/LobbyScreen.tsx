@@ -194,17 +194,6 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
                   <Badge text="O" variant="playerO" />
                 )}
               </View>
-
-              {/* Extra spectators */}
-              {gameState.connectedPlayers > 1 && (
-                <View style={styles.playerRow}>
-                  <View style={[styles.playerDot, styles.dotConnected]} />
-                  <Text style={styles.playerName}>
-                    +{gameState.connectedPlayers - 1} Spectator(s)
-                  </Text>
-                  <Badge text="WATCH" variant="warning" />
-                </View>
-              )}
             </View>
           </Card>
 

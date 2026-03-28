@@ -58,9 +58,13 @@ export function useCaroGame() {
   }, [lastMoveResult]);
 
   const isMyTurn = useMemo(() => {
-    if (gameState.myRole === 'spectator') return false;
+    if (gameState.status !== 'PLAYING') return false;
     return gameState.currentTurn === gameState.mySymbol;
   }, [gameState]);
+
+  const isConnected = useMemo(() => {
+    return gameState.connectedPlayers > 0;
+  }, [gameState.connectedPlayers]);
 
   // Subscribe to native events
   useEffect(() => {
@@ -123,6 +127,33 @@ export function useCaroGame() {
     };
   }, []);
 
+  // Sync game state from native module on mount (re-hydrate after navigation)
+  useEffect(() => {
+    if (!CaroGame) return;
+    const syncState = async () => {
+      try {
+        const stateJson = await CaroGame.getGameState();
+        const parsed: GameStateData = JSON.parse(stateJson);
+        // Only apply if native has active game state
+        if (parsed.myRole) {
+          setGameState(prev => ({
+            ...prev,
+            ...parsed,
+            connectedPlayers: typeof parsed.connectedPlayers === 'string'
+              ? parseInt(parsed.connectedPlayers as unknown as string, 10) || 0
+              : parsed.connectedPlayers,
+          }));
+        }
+        const boardJson = await CaroGame.getBoard();
+        const boardParsed: CaroMoveData[] = JSON.parse(boardJson);
+        if (boardParsed.length > 0) {
+          setMoves(boardParsed);
+        }
+      } catch {}
+    };
+    syncState();
+  }, []);
+
   // Fetch initial board
   const refreshBoard = useCallback(async () => {
     if (!CaroGame) return;
@@ -147,19 +178,34 @@ export function useCaroGame() {
       if (!CaroGame) return;
       try {
         const json = await CaroGame.placeMove(x, y);
-        const result: MoveResultData = JSON.parse(json);
+        const raw = JSON.parse(json);
+        // Safely coerce booleans (native may send strings or actual booleans)
+        const result: MoveResultData = {
+          ...raw,
+          success: raw.success === true || raw.success === 'true',
+          isWin: raw.isWin === true || raw.isWin === 'true',
+          isDraw: raw.isDraw === true || raw.isDraw === 'true',
+        };
         setLastMoveResult(result);
 
-        if (result.success) {
+        if (result.success && result.isWin) {
+          // Host returns win info immediately — update board and finish
           await refreshBoard();
-          if (result.isWin || result.isDraw) {
-            setGameState(prev => ({
-              ...prev,
-              status: 'FINISHED',
-              winner: result.winner,
-            }));
-          }
+          setGameState(prev => ({
+            ...prev,
+            status: 'FINISHED',
+            winner: result.winner,
+          }));
+        } else if (result.success && result.isDraw) {
+          await refreshBoard();
+          setGameState(prev => ({
+            ...prev,
+            status: 'FINISHED',
+            winner: 'DRAW',
+          }));
         }
+        // For normal moves: board updates arrive via onBoardUpdate event from Room observer.
+        // No need to manually refreshBoard — it would be stale for challenger anyway.
         return result;
       } catch {
         return null;
@@ -251,6 +297,7 @@ export function useCaroGame() {
     lastMoveResult,
     winningCells,
     isMyTurn,
+    isConnected,
     loading,
     error,
 

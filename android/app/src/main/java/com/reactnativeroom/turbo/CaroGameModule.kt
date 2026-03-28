@@ -21,9 +21,31 @@ import com.reactnativeroom.repository.CaroRepository
 import com.reactnativeroom.service.CaroBleService
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.util.UUID
+
+@Serializable
+data class PlaceMoveResponse(
+    val success: Boolean,
+    val error: String? = null,
+    val isWin: Boolean = false,
+    val isDraw: Boolean = false,
+    val winner: String? = null,
+    val winningCells: String? = null
+)
+
+@Serializable
+data class GameStateResponse(
+    val gameId: String,
+    val status: String,
+    val myRole: String,
+    val mySymbol: String,
+    val currentTurn: String,
+    val connectedPlayers: Int,
+    val winner: String? = null
+)
 
 @ReactModule(name = CaroGameModule.NAME)
 class CaroGameModule(reactContext: ReactApplicationContext) :
@@ -45,9 +67,10 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
     private var isBound = false
 
     private var gameId = ""
-    private var myRole = ""      // "host" | "challenger" | "spectator"
+    private var myRole = ""      // "host" | "challenger"
     private var mySymbol = ""    // "X" | "O" | ""
     private var connectedPlayers = 0
+    private var boardObserverJob: Job? = null
 
     private val deviceId: String
         get() = Settings.Secure.getString(
@@ -63,14 +86,6 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
             try {
                 val ix = x.toInt()
                 val iy = y.toInt()
-
-                if (myRole == "spectator") {
-                    promise.resolve(Json.encodeToString(mapOf(
-                        "success" to "false",
-                        "error" to "Spectators cannot place moves"
-                    )))
-                    return@launch
-                }
 
                 if (myRole == "host") {
                     // Host places directly + broadcasts
@@ -93,10 +108,16 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
                         moveNumber = moveCount + 1
                     )
                     bleService?.sendMoveToHost(move)
-                    promise.resolve(Json.encodeToString(mapOf(
-                        "success" to "true",
-                        "isWin" to "false",
-                        "isDraw" to "false"
+                    // Return pending — board will update via onBoardUpdate event
+                    promise.resolve(Json.encodeToString(PlaceMoveResponse(
+                        success = true,
+                        isWin = false,
+                        isDraw = false
+                    )))
+                } else {
+                    promise.resolve(Json.encodeToString(PlaceMoveResponse(
+                        success = false,
+                        error = "Cannot place moves"
                     )))
                 }
             } catch (e: Exception) {
@@ -125,14 +146,14 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
                 val moveCount = repo.getMoveCount()
                 val currentTurn = if (moveCount % 2 == 0) "X" else "O"
 
-                val state = mapOf(
-                    "gameId" to gameId,
-                    "status" to (session?.status ?: "WAITING"),
-                    "myRole" to myRole,
-                    "mySymbol" to mySymbol,
-                    "currentTurn" to currentTurn,
-                    "connectedPlayers" to connectedPlayers.toString(),
-                    "winner" to (session?.winner ?: "")
+                val state = GameStateResponse(
+                    gameId = gameId,
+                    status = session?.status ?: "WAITING",
+                    myRole = myRole,
+                    mySymbol = mySymbol,
+                    currentTurn = currentTurn,
+                    connectedPlayers = connectedPlayers,
+                    winner = session?.winner
                 )
                 promise.resolve(Json.encodeToString(state))
             } catch (e: Exception) {
@@ -329,9 +350,8 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
     }
 
     private fun setupBleCallbacks() {
-        bleService?.onMoveReceived = { move ->
-            sendEvent("onBoardUpdate", Json.encodeToString(move))
-        }
+        // onMoveReceived only used by challenger — host gets board updates via Room observer
+        bleService?.onMoveReceived = { _ -> }
 
         bleService?.onPlayerConnected = { role ->
             connectedPlayers++
@@ -339,7 +359,7 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
         }
 
         bleService?.onPlayerDisconnected = {
-            connectedPlayers--
+            connectedPlayers = maxOf(0, connectedPlayers - 1)
             sendEvent("onPlayerDisconnected", "")
         }
 
@@ -370,7 +390,9 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun addListener(eventName: String) {
         if (eventName == "onBoardUpdate") {
-            moduleScope.launch {
+            // Cancel any previous observer to prevent duplicate emissions
+            boardObserverJob?.cancel()
+            boardObserverJob = moduleScope.launch {
                 repo.observeMoves.collectLatest { moves ->
                     sendEvent("onBoardUpdate", Json.encodeToString(moves))
                 }
@@ -392,20 +414,21 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
     // ── Helpers ──────────────────────────────────────────────────────────
 
     private fun serializeMoveResult(result: com.reactnativeroom.repository.MoveResult): String {
-        val map = mutableMapOf(
-            "success" to result.success.toString(),
-            "isWin" to (result.winResult?.isWin?.toString() ?: "false"),
-            "isDraw" to result.isDraw.toString()
+        val response = PlaceMoveResponse(
+            success = result.success,
+            error = result.error,
+            isWin = result.winResult?.isWin ?: false,
+            isDraw = result.isDraw,
+            winner = result.winResult?.winner,
+            winningCells = result.winResult?.winningCells?.let { cells ->
+                Json.encodeToString(cells.map { listOf(it.first, it.second) })
+            }
         )
-        result.error?.let { map["error"] = it }
-        result.winResult?.winner?.let { map["winner"] = it }
-        result.winResult?.winningCells?.let { cells ->
-            map["winningCells"] = Json.encodeToString(cells.map { listOf(it.first, it.second) })
-        }
-        return Json.encodeToString(map)
+        return Json.encodeToString(response)
     }
 
     override fun invalidate() {
+        boardObserverJob?.cancel()
         moduleScope.cancel()
         bleService?.cleanup()
         unbindBleService()

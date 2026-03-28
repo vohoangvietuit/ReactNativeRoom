@@ -1,4 +1,4 @@
-import React, {useCallback} from 'react';
+import React, {useCallback, useEffect, useRef} from 'react';
 import {View, StyleSheet, Alert} from 'react-native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {useCaroGame} from '../hooks/useCaroGame';
@@ -20,13 +20,36 @@ export const GameScreen: React.FC<GameScreenProps> = ({navigation}) => {
     lastMove,
     winningCells,
     isMyTurn,
+    isConnected,
     placeMove,
     stopGame,
   } = useCaroGame();
 
-  const isSpectator = gameState.myRole === 'spectator';
   const isFinished = gameState.status === 'FINISHED';
-  const disabled = !isMyTurn || isSpectator || isFinished;
+  const disabled = !isMyTurn || isFinished;
+
+  // Track previous connection state to detect disconnect during gameplay
+  const wasConnected = useRef(false);
+  useEffect(() => {
+    if (isConnected) {
+      wasConnected.current = true;
+    } else if (wasConnected.current && !isConnected && gameState.status === 'PLAYING') {
+      Alert.alert(
+        'Connection Lost',
+        'The other player has disconnected.',
+        [
+          {
+            text: 'Back to Menu',
+            onPress: () => {
+              stopGame();
+              navigation.popToTop();
+            },
+          },
+          {text: 'Wait', style: 'cancel'},
+        ],
+      );
+    }
+  }, [isConnected, gameState.status, stopGame, navigation]);
 
   const handleCellPress = useCallback(
     async (x: number, y: number) => {

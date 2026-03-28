@@ -1,7 +1,7 @@
 import React from 'react';
 import {View, Text, StyleSheet} from 'react-native';
 import {Badge} from '../ui/Badge';
-import {colors, spacing, fontSize, borderRadius} from '../../theme';
+import {colors, spacing, fontSize} from '../../theme';
 
 interface GameHUDProps {
   mySymbol: string;
@@ -20,7 +20,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
   connectedPlayers,
   status,
 }) => {
-  const isMyTurn = currentTurn === mySymbol && myRole !== 'spectator';
+  const isMyTurn = currentTurn === mySymbol;
   const turnLabel = isMyTurn ? 'Your Turn' : `${currentTurn}'s Turn`;
 
   return (
@@ -39,13 +39,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
             <Text style={styles.youLabel}>You</Text>
             <Badge
               text={myRole || 'none'}
-              variant={
-                myRole === 'host'
-                  ? 'success'
-                  : myRole === 'spectator'
-                    ? 'warning'
-                    : 'default'
-              }
+              variant={myRole === 'host' ? 'success' : 'default'}
             />
           </View>
         </View>
@@ -68,17 +62,10 @@ export const GameHUD: React.FC<GameHUDProps> = ({
         </View>
 
         <View style={styles.statsCol}>
-          <Text style={styles.statValue}>{connectedPlayers}</Text>
-          <Text style={styles.statLabel}>Players</Text>
+          <View style={[styles.connectionDot, connectedPlayers > 0 ? styles.dotOnline : styles.dotOffline]} />
+          <Text style={styles.statLabel}>{connectedPlayers > 0 ? 'Online' : 'Offline'}</Text>
         </View>
       </View>
-
-      {/* Spectator banner */}
-      {myRole === 'spectator' && (
-        <View style={styles.spectatorBanner}>
-          <Text style={styles.spectatorText}>SPECTATING</Text>
-        </View>
-      )}
     </View>
   );
 };
@@ -151,17 +138,16 @@ const styles = StyleSheet.create({
     fontSize: fontSize.xs,
     color: colors.textMuted,
   },
-  spectatorBanner: {
-    marginTop: spacing.sm,
-    backgroundColor: 'rgba(245, 158, 11, 0.15)',
-    paddingVertical: spacing.xs,
-    borderRadius: borderRadius.sm,
-    alignItems: 'center',
+  connectionDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    marginBottom: 2,
   },
-  spectatorText: {
-    color: colors.warning,
-    fontSize: fontSize.xs,
-    fontWeight: '800',
-    letterSpacing: 2,
+  dotOnline: {
+    backgroundColor: colors.success,
+  },
+  dotOffline: {
+    backgroundColor: colors.error,
   },
 });

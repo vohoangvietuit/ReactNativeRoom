@@ -406,6 +406,27 @@ class CaroBleService : Service() {
         Log.d(TAG, "Sent move to host: (${ move.x}, ${move.y})")
     }
 
+    // Pending GATT operations queue — Android BLE allows only one at a time
+    private val pendingGattOps = java.util.concurrent.ConcurrentLinkedQueue<() -> Unit>()
+    private var gattBusy = false
+
+    private fun enqueueGattOp(op: () -> Unit) {
+        pendingGattOps.add(op)
+        drainGattQueue()
+    }
+
+    private fun drainGattQueue() {
+        if (gattBusy) return
+        val next = pendingGattOps.poll() ?: return
+        gattBusy = true
+        next()
+    }
+
+    private fun onGattOpComplete() {
+        gattBusy = false
+        drainGattQueue()
+    }
+
     private val clientGattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
@@ -414,6 +435,8 @@ class CaroBleService : Service() {
                 Log.d(TAG, "Connected to host")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 isJoined = false
+                pendingGattOps.clear()
+                gattBusy = false
                 onPlayerDisconnected?.invoke()
                 Log.d(TAG, "Disconnected from host")
             }
@@ -428,34 +451,52 @@ class CaroBleService : Service() {
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) return
 
-            // Subscribe to NOTIFY characteristic for live move updates
+            // Chain BLE operations: subscribe to move notify → subscribe to control → full sync
+            // Android BLE only allows one pending GATT operation at a time.
+
+            // Step 1: Subscribe to MOVE_NOTIFY
             val notifyChar = gatt
                 .getService(BleConstants.CARO_SERVICE_UUID)
                 ?.getCharacteristic(BleConstants.MOVE_NOTIFY_CHAR_UUID)
 
             if (notifyChar != null) {
-                gatt.setCharacteristicNotification(notifyChar, true)
-                val descriptor = notifyChar.getDescriptor(BleConstants.CCCD_UUID)
-                descriptor?.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                gatt.writeDescriptor(descriptor)
+                enqueueGattOp {
+                    gatt.setCharacteristicNotification(notifyChar, true)
+                    val descriptor = notifyChar.getDescriptor(BleConstants.CCCD_UUID)
+                    descriptor?.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    gatt.writeDescriptor(descriptor)
+                }
             }
 
-            // Also subscribe to game control notifications
+            // Step 2: Subscribe to GAME_CONTROL (queued, runs after step 1 completes)
             val controlChar = gatt
                 .getService(BleConstants.CARO_SERVICE_UUID)
                 ?.getCharacteristic(BleConstants.GAME_CONTROL_CHAR_UUID)
 
             if (controlChar != null) {
-                gatt.setCharacteristicNotification(controlChar, true)
-                val descriptor = controlChar.getDescriptor(BleConstants.CCCD_UUID)
-                descriptor?.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                gatt.writeDescriptor(descriptor)
+                enqueueGattOp {
+                    gatt.setCharacteristicNotification(controlChar, true)
+                    val descriptor = controlChar.getDescriptor(BleConstants.CCCD_UUID)
+                    descriptor?.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    gatt.writeDescriptor(descriptor)
+                }
             }
 
-            // Request full board history on first connect
-            requestFullSync(gatt)
+            // Step 3: Request full board sync (queued, runs after step 2 completes)
+            enqueueGattOp {
+                requestFullSync(gatt)
+            }
 
             onPlayerConnected?.invoke("joined")
+        }
+
+        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d(TAG, "Descriptor write success for ${descriptor.characteristic.uuid}")
+            } else {
+                Log.e(TAG, "Descriptor write failed for ${descriptor.characteristic.uuid}, status=$status")
+            }
+            onGattOpComplete()
         }
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
@@ -495,6 +536,7 @@ class CaroBleService : Service() {
                     Log.e(TAG, "Failed to parse full sync data", e)
                 }
             }
+            onGattOpComplete()
         }
     }
 
