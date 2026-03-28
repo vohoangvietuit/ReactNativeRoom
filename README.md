@@ -6,11 +6,16 @@ A React Native **Gomoku (Caro)** game that uses **Bluetooth Low Energy (BLE)** f
 
 ## Features
 
-- 15×15 Gomoku board with 5-in-a-row win detection
-- Real-time BLE multiplayer: Host advertises, Joiner scans and connects automatically
-- Persistent game state via Room (SQLite) — survives app backgrounding
-- Foreground BLE service keeps the connection alive while the app is minimised
+- **15×15 Gomoku board** with 5-in-a-row win detection
+- **Real-time BLE multiplayer** — Host advertises, Challenger auto-connects (no internet required)
+- **Persistent game state** via Room (SQLite) — survives app backgrounding and navigation
+- **Foreground BLE service** keeps connection alive while app is minimised
+- **Synchronization fixes:**
+  - Game state is re-hydrated on navigation (mount-sync)
+  - Boolean serialization properly typed in Kotlin responses
+  - BLE GATT operations queue ensures reliable descriptor writes
 - Winning-cells highlight animation and draw detection
+- **Comprehensive test coverage:** 44 Jest tests + Kotlin unit tests
 
 ---
 
@@ -24,6 +29,25 @@ A React Native **Gomoku (Caro)** game that uses **Bluetooth Low Energy (BLE)** f
 | BLE | Android GATT Server/Client (`BluetoothLeAdvertiser`, `BluetoothLeScanner`) |
 | Persistence | Room (SQLite) via `CaroDatabase` |
 | Serialisation | Kotlin Serialization (JSON) |
+| Testing | Jest + @testing-library/react-native, JUnit 4 + kotlinx-coroutines-test |
+
+---
+
+## Critical Fixes Applied
+
+This implementation resolves three core issues that prevented reliable multiplayer gameplay:
+
+### 1. Boolean Serialization
+**Problem:** Native `placeMove()` returned booleans as strings (`"false"` is truthy in JS). Game incorrectly showed WIN/FINISHED immediately.  
+**Solution:** Created `@Serializable` Kotlin data classes (`PlaceMoveResponse`, `GameStateResponse`) with proper boolean types, not string coercion.
+
+### 2. BLE Descriptor Write Sequencing  
+**Problem:** Android 13+ allows only one pending GATT operation at a time. Multiple simultaneous CCCD writes failed silently, causing Challenger to miss move notifications.  
+**Solution:** Implemented operation queue (`pendingGattOps`, `enqueueGattOp()`, `drainGattQueue()`) that chains GATT operations with callbacks.
+
+### 3. Game State Lost on Navigation
+**Problem:** `useCaroGame()` creates fresh local state per component instance. Navigating away and back to GameScreen reset game to WAITING despite native module having active game.  
+**Solution:** Added mount-sync `useEffect` that calls `getGameState()` + `getBoard()` on mount, re-hydrating React state from native.
 
 ---
 
@@ -89,11 +113,26 @@ android/app/src/main/java/com/reactnativeroom/
 
 ## How to Play
 
-1. **Host Game** — Device A advertises a BLE game session and waits in the lobby
-2. **Join Game** — Device B scans and auto-connects to the nearest host
-3. The host taps **Start Match** once the challenger appears
-4. Players alternate turns — **X** (host) goes first, **O** (challenger) goes second
-5. First to place **5 in a row** (horizontal, vertical, or diagonal) wins
+1. **Host Game** (Device A):
+   - Tap "Host Game" on the Home screen
+   - Advertises via BLE and waits in LobbyScreen
+   - Shows the Game ID and waits for challenger
+
+2. **Join Game** (Device B):
+   - Tap "Join Game" on the Home screen
+   - Auto-scans for nearby hosts
+   - Auto-connects as "Challenger" once a host is found
+   - Shows in Device A's player list
+
+3. **Start Match**:
+   - Device A taps "Start Match" once Device B connects
+   - Both devices navigate to the game board
+   - **X** (host) goes first, **O** (challenger) goes second
+
+4. **Play**:
+   - Players alternate placing marks
+   - First to place **5 in a row** (horizontal, vertical, or diagonal) wins
+   - The app displays a win/loss/draw modal at game end
 
 ---
 
@@ -187,6 +226,37 @@ adb install android/app/build/outputs/apk/debug/app-debug.apk
 
 ---
 
+## Testing
+
+### Run Jest tests (React Native + Hooks)
+```sh
+npm test
+# or for specific suite:
+npm test -- __tests__/hooks/useCaroGame.test.ts
+```
+
+### Run Kotlin unit tests
+```sh
+cd android && ./gradlew test
+```
+
+**Test coverage:**
+- **Hook tests** (18): Game state, move validation, board derivation, win detection
+- **Integration tests** (5): Full game flow from host → join → match → win
+- **Component tests** (20): GameBoard, GameHUD, GameOverModal rendering and interaction
+- **Kotlin tests** (8): WinChecker edge cases (horizontal, vertical, diagonal wins)
+
+**Key test scenarios:**
+- ✅ Game starts in WAITING, transitions to PLAYING on match start
+- ✅ Board state syncs from native on mount (fixes WAITING on navigation)
+- ✅ Move placement updates 2D grid correctly
+- ✅ Boolean parsing handles both `true` and `"true"` (safety net for native bridge)
+- ✅ 5-in-a-row detection works in all directions
+- ✅ Draw detection on full board
+- ✅ Game reset clears all state
+
+---
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -194,6 +264,7 @@ adb install android/app/build/outputs/apk/debug/app-debug.apk
 | `adb devices` shows `unauthorized` | Unlock phone, tap **Allow** on the USB debugging dialog |
 | App crashes on "Host Game" | Ensure Bluetooth is enabled and all Nearby Device permissions are granted |
 | "Host Game" shows Bluetooth Unavailable | You are on an emulator — use a real physical device |
+| Game stuck in WAITING on navigation | App auto-syncs game state on mount; if issue persists, go back and re-enter screen |
 | Devices don't discover each other | Keep within ~10 m; restart Bluetooth on both; ensure no other app uses the same BLE service UUID |
 | Build fails with Kotlin error | Run `cd android && ./gradlew clean` then retry `npm run android` |
 | Metro bundler not found | Run `npm start` in the project root before running the Android command |

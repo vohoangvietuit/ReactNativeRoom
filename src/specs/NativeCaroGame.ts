@@ -21,9 +21,9 @@ export type MoveResultData = {
 
 export type GameStateData = {
   gameId: string;
-  status: string;     // "WAITING" | "PLAYING" | "FINISHED"
-  myRole: string;     // "host" | "challenger" | "spectator"
-  mySymbol: string;   // "X" | "O" | ""
+  status: string; // "WAITING" | "PLAYING" | "FINISHED"
+  myRole: string; // "host" | "challenger"
+  mySymbol: string; // "X" | "O" | ""
   currentTurn: string; // "X" | "O"
   connectedPlayers: number;
   winner?: string;

@@ -39,16 +39,10 @@ const sections = [
     ],
   },
   {
-    icon: '👀',
-    title: 'Spectating',
-    content:
-      'If a game already has two players, you join as a Spectator. You can watch the game in real-time but cannot place any moves. A "SPECTATING" banner will appear on your screen.',
-  },
-  {
     icon: '⚡',
     title: 'How It Works (Technical)',
     content:
-      'This app demonstrates a real-world pattern: React Native TurboModules bridge to Kotlin native code. The game engine uses Room (SQLite) for the board state, Bluetooth Low Energy (GATT Server/Client) for peer-to-peer sync, and Kotlin Coroutines for async operations. The Host\'s database is the single source of truth — all moves are validated server-side before broadcasting.',
+      "This app demonstrates a real-world pattern: React Native TurboModules bridge to Kotlin native code. The game engine uses Room (SQLite) for persistent board state, Bluetooth Low Energy (GATT Server/Client) for real-time peer-to-peer sync, and Kotlin Coroutines for async operations. The Host's database is the single source of truth — all moves are validated, and game state is automatically re-synced when navigating.",
   },
   {
     icon: '💡',
@@ -58,7 +52,7 @@ const sections = [
       'Try to create "open fours" — 4 in a row with both ends open',
       'Block your opponent when they have 3 in a row',
       'Think 2-3 moves ahead',
-      'Watch for diagonal threats — they\'re easy to miss!',
+      "Watch for diagonal threats — they're easy to miss!",
     ],
   },
 ];

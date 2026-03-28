@@ -9,6 +9,7 @@
 1. [What We're Building](#1-what-were-building)
 2. [Project Setup & Dependencies](#2-project-setup--dependencies)
 3. [Architecture Overview](#3-architecture-overview)
+3.1. [Critical Implementation Details](#31-critical-implementation-details)
 4. [Kotlin Fundamentals](#4-kotlin-fundamentals)
 5. [Room Database — Storing Game Moves](#5-room-database--storing-game-moves)
 6. [Game Logic — Win Detection](#6-game-logic--win-detection)
@@ -27,17 +28,18 @@
 
 ## 1. What We're Building
 
-A **real-time multiplayer Caro game** (Gomoku — 5-in-a-row on a 15×15 board) where two Android phones can play against each other over Bluetooth, with spectators able to watch. No internet, no server, no latency.
+A **real-time multiplayer Caro game** (Gomoku — 5-in-a-row on a 15×15 board) where two Android phones can play against each other over Bluetooth. No internet, no server, no latency. Features proper game state synchronization with comprehensive test coverage.
 
 ### Game Mechanics
 
 - **15×15 board** with X and O players
 - **5-in-a-row wins** (horizontal, vertical, or diagonal)
-- **Two game modes:**
+- **Two player modes:**
   - **Host** — creates a game, advertises via BLE, plays as X
   - **Challenger** — scans for games, joins as O
-  - **Spectators** — others can join and watch (read-only)
-- **Real-time sync** — moves appear on both devices instantly via BLE GATT notifications
+- **Real-time sync** — moves appear on both devices instantly via BLE GATT notifications with proper CCCD descriptor write sequencing
+- **Game state persistence** — all moves stored in Room database; game state re-hydrates on app navigation
+- **Proper serialization** — Boolean fields in native responses are properly typed (not string coercion)
 - **Game history** — all moves stored in Room database, persist between sessions
 
 ### Complete Architecture
@@ -184,12 +186,19 @@ plugins {
 1. **GameScreen** → User taps cell (x, y)
 2. `placeMove(x, y)` → calls `NativeModules.CaroGame.placeMove(x, y)`
 3. **CaroGameModule.placeMove()**:
+   - Returns `PlaceMoveResponse` with properly typed booleans (not string coercion)
    - If **host**: `CaroRepository.placeMove(x, y)` → saves to DB → validates → checks win → broadcasts move via BLE
    - If **challenger**: sends move to host via BLE WRITE characteristic
    - Host receives move, validates, saves, broadcasts back to all subscribers
-4. **BLE GATT Server notifies** all connected devices
-5. `useCaroGame` hook listens via `NativeEventEmitter`, updates React state
-6. **GameScreen re-renders** with new board state
+4. **BLE GATT operations are queued** — CCCD descriptor writes no longer race, ensuring reliable subscriptions
+5. **BLE GATT Server notifies** all connected devices
+6. `useCaroGame` hook listens via `NativeEventEmitter`, updates React state
+7. **GameScreen re-renders** with new board state
+
+**Key improvements:**
+- Hook safely coerces booleans: `raw.success === true || raw.success === 'true'`
+- Hook only calls `refreshBoard()` on win/draw (normal moves update via `onBoardUpdate` Room observer)
+- Mount-sync useEffect re-hydrates game state from native module (fixes WAITING on navigation)
 
 #### End of Game:
 
@@ -205,7 +214,7 @@ plugins {
 GameState (React hook)
   ├─ gameId: string (set by host, shared to joiners)
   ├─ status: "WAITING" | "PLAYING" | "FINISHED"
-  ├─ myRole: "host" | "challenger" | "spectator"
+  ├─ myRole: "host" | "challenger"
   ├─ mySymbol: "X" | "O" | ""
   ├─ currentTurn: "X" | "O"
   ├─ connectedPlayers: number
@@ -214,7 +223,132 @@ GameState (React hook)
 Board (2D array of CellValue)
   └─ Derived from moves[] list: [CaroMoveData, ...]
      where each move = { x, y, playerSymbol, moveNumber, timestamp }
+     
+Sync on Mount:
+  └─ useEffect calls getGameState() + getBoard() to re-hydrate from native
+     (fixes WAITING status when navigating back to GameScreen)
 ```
+
+---
+
+## 3.1 Critical Implementation Details
+
+The following three design decisions ensure reliable multiplayer gameplay. Understanding them is key to preventing common pitfalls.
+
+### Design 1: Typed Boolean Serialization
+
+**The Problem:**  
+Native Kotlin methods return boolean fields, but the TurboModule bridge serializes everything to JSON strings. When JavaScript receives `{"success":"false"}`, the string `"false"` is truthy — causing immediate WIN when `isWin: false` should mean the game continues.
+
+**The Solution:**  
+Create `@Serializable` Kotlin data classes with explicit boolean fields:
+
+```kotlin
+@Serializable
+data class PlaceMoveResponse(
+    val success: Boolean,     // Proper boolean type
+    val isWin: Boolean,       // Not a string
+    val isDraw: Boolean,
+    val winner: String? = null,
+    val winningCells: String? = null,  // Only this stays as serialized JSON string
+    val error: String? = null
+)
+```
+
+Then in `CaroGameModule.placeMove()`, invoke the response directly without `.toString()` — Kotlin Serialization handles the JSON encoding with proper types.
+
+In React, safely coerce at the boundary:
+```typescript
+const result: MoveResultData = {
+  ...raw,
+  success: raw.success === true || raw.success === 'true',  // Safety net
+  isWin: raw.isWin === true || raw.isWin === 'true',
+  isDraw: raw.isDraw === true || raw.isDraw === 'true',
+};
+```
+
+### Design 2: BLE GATT Operation Queue
+
+**The Problem:**  
+Android's `BluetoothGattServer` callback model allows only one pending GATT operation at a time. When Challenger connects, we must:
+1. Write CCCD for MOVE_NOTIFY_CHAR (enable notifications)
+2. Write CCCD for GAME_CONTROL_CHAR (enable control notifications)
+3. Request full board state (READ operation)
+
+If these happen simultaneously, operations 2 and 3 may silently fail, leaving Challenger without notifications.
+
+**The Solution:**  
+Implement a sequential operation queue:
+
+```kotlin
+// In CaroBleService
+private val pendingGattOps = ConcurrentLinkedQueue<GattOp>()
+private var gattBusy = false
+
+data class GattOp(val descriptor: UUID, val value: ByteArray)
+
+fun enqueueGattOp(descriptor: UUID, value: ByteArray) {
+    pendingGattOps.add(GattOp(descriptor, value))
+    if (!gattBusy) drainGattQueue()
+}
+
+private fun drainGattQueue() {
+    val op = pendingGattOps.poll() ?: return
+    gattBusy = true
+    // Perform write; on completion, onGattOpComplete() will drain next
+}
+
+fun onGattOpComplete() {
+    gattBusy = false
+    drainGattQueue()  // Process next queued operation
+}
+
+override fun onDescriptorWrite(
+    device: BluetoothDevice,
+    requestId: Int,
+    descriptor: BluetoothGattDescriptor,
+    preparedWrite: Boolean,
+    responseNeeded: Boolean,
+    offset: Int,
+    value: ByteArray
+) {
+    // ... handle write ...
+    sendResponse(device, requestId, GATT_SUCCESS, 0, null)
+    onGattOpComplete()  // Trigger next operation
+}
+```
+
+### Design 3: Mount-Sync for Game State Re-hydration
+
+**The Problem:**  
+React hooks initialize fresh local state on mount. When user navigates from GameScreen → HomeScreen → back to GameScreen, `useCaroGame()` creates a new instance with `status: 'WAITING'` and `myRole: ''`, losing sight of the active game in the native module.
+
+**The Solution:**  
+Add a mount-sync `useEffect` that fetches state from native on component mount:
+
+```typescript
+// In useCaroGame.ts
+useEffect(() => {
+  if (!CaroGame) return;
+  const syncState = async () => {
+    try {
+      const stateJson = await CaroGame.getGameState();
+      const parsed: GameStateData = JSON.parse(stateJson);
+      if (parsed.myRole) {  // Only update if native has active game
+        setGameState(prev => ({...prev, ...parsed}));
+      }
+      const boardJson = await CaroGame.getBoard();
+      const boardParsed: CaroMoveData[] = JSON.parse(boardJson);
+      if (boardParsed.length > 0) {
+        setMoves(boardParsed);
+      }
+    } catch {}
+  };
+  syncState();
+}, []);  // Empty deps: runs once on mount
+```
+
+This ensures React state matches native reality, preventing WAITING when the game is PLAYING.
 
 ---
 
@@ -785,10 +919,7 @@ class CaroRepository(private val dao: CaroDao) {
 - Subscribes to MOVE_NOTIFY_CHAR (gets move notifications)
 - Sends own moves via MOVE_WRITE_CHAR
 
-**Spectators:**
-- Join after game starts
-- Can subscribe to MOVE_NOTIFY_CHAR (read-only)
-- Cannot write moves
+**Note:** Spectator mode was removed to simplify the game flow. Only Host and Challenger can participate.
 
 ### Constants & UUID management
 
