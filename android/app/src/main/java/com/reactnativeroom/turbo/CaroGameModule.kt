@@ -1,12 +1,17 @@
 package com.reactnativeroom.turbo
 
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
+import androidx.core.content.ContextCompat
 import com.facebook.react.bridge.*
 import com.facebook.react.module.annotations.ReactModule
 import com.facebook.react.modules.core.DeviceEventManagerModule
@@ -138,10 +143,49 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
 
     // ── Hosting / Joining ────────────────────────────────────────────────
 
+    private fun bluetoothAdapter(): BluetoothAdapter? {
+        val mgr = reactApplicationContext.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        return mgr?.adapter
+    }
+
+    private fun hasBlePermissions(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            return listOf(
+                android.Manifest.permission.BLUETOOTH_SCAN,
+                android.Manifest.permission.BLUETOOTH_CONNECT,
+                android.Manifest.permission.BLUETOOTH_ADVERTISE
+            ).all {
+                ContextCompat.checkSelfPermission(reactApplicationContext, it) == PackageManager.PERMISSION_GRANTED
+            }
+        }
+        return ContextCompat.checkSelfPermission(
+            reactApplicationContext,
+            android.Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
     @ReactMethod
     fun startHosting(playerName: String, promise: Promise) {
         moduleScope.launch {
             try {
+                if (!hasBlePermissions()) {
+                    promise.reject("HOST_ERROR", "Bluetooth permissions not granted. Please allow Bluetooth access and try again.")
+                    return@launch
+                }
+                val btAdapter = bluetoothAdapter()
+                if (btAdapter == null) {
+                    promise.reject("HOST_ERROR", "Bluetooth is not available on this device")
+                    return@launch
+                }
+                if (!btAdapter.isEnabled) {
+                    promise.reject("HOST_ERROR", "Bluetooth is turned off. Please enable Bluetooth and try again.")
+                    return@launch
+                }
+                if (btAdapter.bluetoothLeAdvertiser == null) {
+                    promise.reject("HOST_ERROR", "BLE advertising is not supported on this device. Use a real Android phone with Bluetooth enabled.")
+                    return@launch
+                }
+
                 gameId = UUID.randomUUID().toString().take(8)
                 myRole = "host"
                 mySymbol = "X"
@@ -171,6 +215,24 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun joinGame(playerName: String, promise: Promise) {
+        if (!hasBlePermissions()) {
+            promise.reject("JOIN_ERROR", "Bluetooth permissions not granted. Please allow Bluetooth access and try again.")
+            return
+        }
+        val btAdapter = bluetoothAdapter()
+        if (btAdapter == null) {
+            promise.reject("JOIN_ERROR", "Bluetooth is not available on this device")
+            return
+        }
+        if (!btAdapter.isEnabled) {
+            promise.reject("JOIN_ERROR", "Bluetooth is turned off. Please enable Bluetooth and try again.")
+            return
+        }
+        if (btAdapter.bluetoothLeScanner == null) {
+            promise.reject("JOIN_ERROR", "BLE scanning is not supported on this device. Use a real Android phone with Bluetooth enabled.")
+            return
+        }
+
         myRole = "challenger" // Will be downgraded to spectator if challenger slot taken
         mySymbol = "O"
 

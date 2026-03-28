@@ -149,6 +149,9 @@ Make sure Metro is running (`npm start`), then in a second terminal:
 # Build debug APK and deploy to connected device
 npm run android
 
+# Build release
+npx react-native run-android --mode release
+
 # OR target a specific device if you have multiple connected
 npx react-native run-android --deviceId <device-serial>
 ```

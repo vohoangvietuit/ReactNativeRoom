@@ -1,10 +1,12 @@
-import React, {useEffect, useRef} from 'react';
+import React, {useEffect, useRef, useCallback} from 'react';
 import {
   View,
   Text,
   StyleSheet,
   Animated,
   Easing,
+  Platform,
+  PermissionsAndroid,
 } from 'react-native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {useCaroGame} from '../hooks/useCaroGame';
@@ -52,17 +54,43 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
     ).start();
   }, [pulseAnim]);
 
-  useEffect(() => {
-    if (role === 'host') {
-      startHosting('Player').catch(() => {
-        /* error shown via hook's error state */
-      });
-    } else {
-      joinGame('Player').catch(() => {
-        /* error shown via hook's error state */
-      });
+  const requestBlePermissions = useCallback(async (): Promise<boolean> => {
+    if (Platform.OS !== 'android') return true;
+    if (Platform.Version < 31) {
+      const loc = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        {
+          title: 'Location Permission',
+          message: 'Caro BLE needs location access for Bluetooth scanning.',
+          buttonPositive: 'Allow',
+        },
+      );
+      return loc === PermissionsAndroid.RESULTS.GRANTED;
     }
-  }, [role, startHosting, joinGame]);
+    const results = await PermissionsAndroid.requestMultiple([
+      PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+      PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+      PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
+    ]);
+    return Object.values(results).every(
+      r => r === PermissionsAndroid.RESULTS.GRANTED,
+    );
+  }, []);
+
+  useEffect(() => {
+    const init = async () => {
+      // Request BLE permissions before starting BLE operations.
+      // Even if denied, we still call startHosting/joinGame so the native
+      // side rejects with a descriptive error that surfaces in the UI.
+      await requestBlePermissions();
+      if (role === 'host') {
+        await startHosting('Player').catch(() => {});
+      } else {
+        await joinGame('Player').catch(() => {});
+      }
+    };
+    init();
+  }, [role, startHosting, joinGame, requestBlePermissions]);
 
   // Navigate to game when match starts
   useEffect(() => {
@@ -90,7 +118,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
         ) : null}
       </View>
 
-      {/* Error state */}
+      {/* Error state — shown instead of lobby UI when BLE fails */}
       {error ? (
         <View style={styles.errorCard}>
           <Text style={styles.errorIcon}>⚠️</Text>
@@ -108,99 +136,101 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
             style={styles.errorButton}
           />
         </View>
-      ) : null}
-
-      {/* Scanning animation */}
-      <View style={styles.scanArea}>
-        <Animated.View
-          style={[
-            styles.scanCircleOuter,
-            { transform: [{ scale: pulseAnim }] },
-          ]}
-        />
-        <View style={styles.scanCircleInner}>
-          <Text style={styles.scanIcon}>{role === 'host' ? '📡' : '🔍'}</Text>
-        </View>
-        <Text style={styles.scanText}>
-          {loading
-            ? role === 'host'
-              ? 'Starting BLE advertising...'
-              : 'Scanning for nearby games...'
-            : role === 'host'
-            ? 'Waiting for players to join...'
-            : 'Looking for host...'}
-        </Text>
-      </View>
-
-      {/* Connected players */}
-      <Card style={styles.playersCard}>
-        <Text style={styles.sectionTitle}>Connected Players</Text>
-        <View style={styles.playersList}>
-          {/* Host (always shown) */}
-          <View style={styles.playerRow}>
-            <View style={[styles.playerDot, styles.dotConnected]} />
-            <Text style={styles.playerName}>
-              {role === 'host' ? 'You (Host)' : 'Host'}
-            </Text>
-            <Badge text="X" variant="playerX" />
-          </View>
-
-          {/* Challenger slot */}
-          <View style={styles.playerRow}>
-            <View
+      ) : (
+        <>
+          {/* Scanning animation */}
+          <View style={styles.scanArea}>
+            <Animated.View
               style={[
-                styles.playerDot,
-                gameState.connectedPlayers > 0
-                  ? styles.dotConnected
-                  : styles.dotWaiting,
+                styles.scanCircleOuter,
+                { transform: [{ scale: pulseAnim }] },
               ]}
             />
-            <Text style={styles.playerName}>
-              {gameState.connectedPlayers > 0
-                ? role === 'join'
-                  ? 'You (Challenger)'
-                  : 'Challenger'
-                : 'Waiting for challenger...'}
+            <View style={styles.scanCircleInner}>
+              <Text style={styles.scanIcon}>{role === 'host' ? '📡' : '🔍'}</Text>
+            </View>
+            <Text style={styles.scanText}>
+              {loading
+                ? role === 'host'
+                  ? 'Starting BLE advertising...'
+                  : 'Scanning for nearby games...'
+                : role === 'host'
+                ? 'Waiting for players to join...'
+                : 'Looking for host...'}
             </Text>
-            {gameState.connectedPlayers > 0 && (
-              <Badge text="O" variant="playerO" />
-            )}
           </View>
 
-          {/* Extra spectators */}
-          {gameState.connectedPlayers > 1 && (
-            <View style={styles.playerRow}>
-              <View style={[styles.playerDot, styles.dotConnected]} />
-              <Text style={styles.playerName}>
-                +{gameState.connectedPlayers - 1} Spectator(s)
-              </Text>
-              <Badge text="WATCH" variant="warning" />
-            </View>
-          )}
-        </View>
-      </Card>
+          {/* Connected players */}
+          <Card style={styles.playersCard}>
+            <Text style={styles.sectionTitle}>Connected Players</Text>
+            <View style={styles.playersList}>
+              {/* Host (always shown) */}
+              <View style={styles.playerRow}>
+                <View style={[styles.playerDot, styles.dotConnected]} />
+                <Text style={styles.playerName}>
+                  {role === 'host' ? 'You (Host)' : 'Host'}
+                </Text>
+                <Badge text="X" variant="playerX" />
+              </View>
 
-      {/* Actions */}
-      <View style={styles.actions}>
-        {role === 'host' && (
-          <Button
-            title="Start Match"
-            onPress={startMatch}
-            variant="primary"
-            size="lg"
-            disabled={!canStart}
-            loading={loading}
-            style={styles.actionButton}
-          />
-        )}
-        <Button
-          title="Leave"
-          onPress={handleLeave}
-          variant="outline"
-          size="md"
-          style={styles.actionButton}
-        />
-      </View>
+              {/* Challenger slot */}
+              <View style={styles.playerRow}>
+                <View
+                  style={[
+                    styles.playerDot,
+                    gameState.connectedPlayers > 0
+                      ? styles.dotConnected
+                      : styles.dotWaiting,
+                  ]}
+                />
+                <Text style={styles.playerName}>
+                  {gameState.connectedPlayers > 0
+                    ? role === 'join'
+                      ? 'You (Challenger)'
+                      : 'Challenger'
+                    : 'Waiting for challenger...'}
+                </Text>
+                {gameState.connectedPlayers > 0 && (
+                  <Badge text="O" variant="playerO" />
+                )}
+              </View>
+
+              {/* Extra spectators */}
+              {gameState.connectedPlayers > 1 && (
+                <View style={styles.playerRow}>
+                  <View style={[styles.playerDot, styles.dotConnected]} />
+                  <Text style={styles.playerName}>
+                    +{gameState.connectedPlayers - 1} Spectator(s)
+                  </Text>
+                  <Badge text="WATCH" variant="warning" />
+                </View>
+              )}
+            </View>
+          </Card>
+
+          {/* Actions */}
+          <View style={styles.actions}>
+            {role === 'host' && (
+              <Button
+                title="Start Match"
+                onPress={startMatch}
+                variant="primary"
+                size="lg"
+                disabled={!canStart}
+                loading={loading}
+                style={styles.actionButton}
+              />
+            )}
+            <Button
+              title="Leave"
+              onPress={handleLeave}
+              variant="outline"
+              size="md"
+              style={styles.actionButton}
+            />
+          </View>
+        </>
+      )}
     </View>
   );
 };
