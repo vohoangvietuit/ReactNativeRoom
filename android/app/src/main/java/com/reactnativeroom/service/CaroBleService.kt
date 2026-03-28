@@ -96,6 +96,12 @@ class CaroBleService : Service() {
 
     fun startHosting() {
         if (isHosting) return
+
+        val btAdapter = adapter
+            ?: throw UnsupportedOperationException("Bluetooth is not available on this device")
+        val leAdvertiser = btAdapter.bluetoothLeAdvertiser
+            ?: throw UnsupportedOperationException("BLE advertising is not supported on this device or emulator")
+
         isHosting = true
 
         // Start advertising
@@ -110,7 +116,7 @@ class CaroBleService : Service() {
             .setIncludeDeviceName(false)
             .build()
 
-        adapter.bluetoothLeAdvertiser?.startAdvertising(settings, data, advertiseCallback)
+        leAdvertiser.startAdvertising(settings, data, advertiseCallback)
 
         // Setup GATT server
         setupGattServer()
@@ -338,7 +344,12 @@ class CaroBleService : Service() {
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
-        adapter.bluetoothLeScanner?.startScan(
+        val leScanner = (adapter
+            ?: throw UnsupportedOperationException("Bluetooth is not available on this device"))
+            .bluetoothLeScanner
+            ?: throw UnsupportedOperationException("BLE scanning is not supported on this device or emulator")
+
+        leScanner.startScan(
             listOf(filter), settings,
             object : ScanCallback() {
                 override fun onScanResult(callbackType: Int, result: ScanResult) {
@@ -350,7 +361,7 @@ class CaroBleService : Service() {
     }
 
     fun stopScanning() {
-        adapter.bluetoothLeScanner?.stopScan(object : ScanCallback() {})
+        adapter?.bluetoothLeScanner?.stopScan(object : ScanCallback() {})
     }
 
     fun connectToHost(device: BluetoothDevice) {

@@ -25,6 +25,7 @@ export function useCaroGame() {
   });
   const [lastMoveResult, setLastMoveResult] = useState<MoveResultData | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   // Derive 2D board from moves list
   const board = useMemo(() => {
@@ -168,8 +169,13 @@ export function useCaroGame() {
   );
 
   const startHosting = useCallback(async (playerName: string) => {
-    if (!CaroGame) return '';
+    if (!CaroGame) {
+      const msg = 'Game module not available';
+      setError(msg);
+      throw new Error(msg);
+    }
     setLoading(true);
+    setError(null);
     try {
       const gameId = await CaroGame.startHosting(playerName);
       setGameState(prev => ({
@@ -180,14 +186,23 @@ export function useCaroGame() {
         status: 'WAITING',
       }));
       return gameId;
+    } catch (e: any) {
+      const msg = e?.message || 'Failed to start hosting';
+      setError(msg);
+      throw e;
     } finally {
       setLoading(false);
     }
   }, []);
 
   const joinGame = useCallback(async (playerName: string) => {
-    if (!CaroGame) return;
+    if (!CaroGame) {
+      const msg = 'Game module not available';
+      setError(msg);
+      throw new Error(msg);
+    }
     setLoading(true);
+    setError(null);
     try {
       await CaroGame.joinGame(playerName);
       setGameState(prev => ({
@@ -196,6 +211,10 @@ export function useCaroGame() {
         mySymbol: 'O',
         status: 'WAITING',
       }));
+    } catch (e: any) {
+      const msg = e?.message || 'Failed to join game';
+      setError(msg);
+      throw e;
     } finally {
       setLoading(false);
     }
@@ -233,6 +252,7 @@ export function useCaroGame() {
     winningCells,
     isMyTurn,
     loading,
+    error,
 
     // Actions
     placeMove,

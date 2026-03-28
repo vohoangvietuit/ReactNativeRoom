@@ -21,7 +21,15 @@ interface LobbyScreenProps {
 export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => {
   const insets = useSafeAreaInsets();
   const {role} = route.params;
-  const {gameState, loading, startHosting, joinGame, startMatch, stopGame} = useCaroGame();
+  const {
+    gameState,
+    loading,
+    error,
+    startHosting,
+    joinGame,
+    startMatch,
+    stopGame,
+  } = useCaroGame();
 
   const pulseAnim = useRef(new Animated.Value(1)).current;
 
@@ -46,9 +54,13 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
 
   useEffect(() => {
     if (role === 'host') {
-      startHosting('Player');
+      startHosting('Player').catch(() => {
+        /* error shown via hook's error state */
+      });
     } else {
-      joinGame('Player');
+      joinGame('Player').catch(() => {
+        /* error shown via hook's error state */
+      });
     }
   }, [role, startHosting, joinGame]);
 
@@ -67,7 +79,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
   const canStart = role === 'host' && gameState.connectedPlayers > 0;
 
   return (
-    <View style={[styles.container, {paddingTop: insets.top + spacing.md}]}>
+    <View style={[styles.container, { paddingTop: insets.top + spacing.md }]}>
       {/* Header */}
       <View style={styles.header}>
         <Text style={styles.title}>
@@ -78,18 +90,36 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
         ) : null}
       </View>
 
+      {/* Error state */}
+      {error ? (
+        <View style={styles.errorCard}>
+          <Text style={styles.errorIcon}>⚠️</Text>
+          <Text style={styles.errorTitle}>Bluetooth Unavailable</Text>
+          <Text style={styles.errorMessage}>{error}</Text>
+          <Text style={styles.errorHint}>
+            This feature requires a real Android device with Bluetooth enabled.
+            Simulators and emulators do not support BLE advertising.
+          </Text>
+          <Button
+            title="Go Back"
+            onPress={handleLeave}
+            variant="outline"
+            size="md"
+            style={styles.errorButton}
+          />
+        </View>
+      ) : null}
+
       {/* Scanning animation */}
       <View style={styles.scanArea}>
         <Animated.View
           style={[
             styles.scanCircleOuter,
-            {transform: [{scale: pulseAnim}]},
+            { transform: [{ scale: pulseAnim }] },
           ]}
         />
         <View style={styles.scanCircleInner}>
-          <Text style={styles.scanIcon}>
-            {role === 'host' ? '📡' : '🔍'}
-          </Text>
+          <Text style={styles.scanIcon}>{role === 'host' ? '📡' : '🔍'}</Text>
         </View>
         <Text style={styles.scanText}>
           {loading
@@ -97,8 +127,8 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
               ? 'Starting BLE advertising...'
               : 'Scanning for nearby games...'
             : role === 'host'
-              ? 'Waiting for players to join...'
-              : 'Looking for host...'}
+            ? 'Waiting for players to join...'
+            : 'Looking for host...'}
         </Text>
       </View>
 
@@ -263,5 +293,40 @@ const styles = StyleSheet.create({
   },
   actionButton: {
     width: '100%',
+  },
+  errorCard: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(239,68,68,0.1)',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(239,68,68,0.3)',
+    padding: spacing.lg,
+    marginBottom: spacing.lg,
+  },
+  errorIcon: {
+    fontSize: 32,
+    marginBottom: spacing.sm,
+  },
+  errorTitle: {
+    fontSize: fontSize.lg,
+    fontWeight: '700',
+    color: '#ef4444',
+    marginBottom: spacing.xs,
+  },
+  errorMessage: {
+    fontSize: fontSize.sm,
+    color: colors.textSecondary,
+    textAlign: 'center',
+    marginBottom: spacing.sm,
+  },
+  errorHint: {
+    fontSize: fontSize.xs,
+    color: colors.textMuted,
+    textAlign: 'center',
+    marginBottom: spacing.md,
+    lineHeight: 18,
+  },
+  errorButton: {
+    alignSelf: 'center',
   },
 });

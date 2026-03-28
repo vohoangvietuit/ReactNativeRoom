@@ -151,13 +151,18 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
                 repo.createSession(gameId, deviceId)
 
                 // Bind to BLE service
-                bindBleService {
-                    bleService?.repository = repo
-                    bleService?.gameId = gameId
-                    setupBleCallbacks()
-                    bleService?.startHosting()
-                    promise.resolve(gameId)
-                }
+                bindBleService(
+                    onBound = {
+                        bleService?.repository = repo
+                        bleService?.gameId = gameId
+                        setupBleCallbacks()
+                        bleService?.startHosting()
+                        promise.resolve(gameId)
+                    },
+                    onError = { e ->
+                        promise.reject("HOST_ERROR", e.message ?: "Bluetooth not available", e)
+                    }
+                )
             } catch (e: Exception) {
                 promise.reject("HOST_ERROR", e.message, e)
             }
@@ -169,17 +174,22 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
         myRole = "challenger" // Will be downgraded to spectator if challenger slot taken
         mySymbol = "O"
 
-        bindBleService {
-            bleService?.repository = repo
-            setupBleCallbacks()
-            bleService?.startScanning { device ->
-                // Found a host — connect
-                bleService?.stopScanning()
-                bleService?.connectToHost(device)
-                gameId = "joined" // Will get real ID from host
-                promise.resolve(null)
+        bindBleService(
+            onBound = {
+                bleService?.repository = repo
+                setupBleCallbacks()
+                bleService?.startScanning { device ->
+                    // Found a host — connect
+                    bleService?.stopScanning()
+                    bleService?.connectToHost(device)
+                    gameId = "joined" // Will get real ID from host
+                    promise.resolve(null)
+                }
+            },
+            onError = { e ->
+                promise.reject("JOIN_ERROR", e.message ?: "Bluetooth not available", e)
             }
-        }
+        )
     }
 
     @ReactMethod
@@ -219,15 +229,24 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
 
     // ── BLE Service Binding ──────────────────────────────────────────────
 
-    private fun bindBleService(onBound: () -> Unit) {
+    private fun bindBleService(onBound: () -> Unit, onError: (Exception) -> Unit = {}) {
         val intent = Intent(reactApplicationContext, CaroBleService::class.java)
-        reactApplicationContext.startForegroundService(intent)
+        try {
+            reactApplicationContext.startForegroundService(intent)
+        } catch (e: Exception) {
+            onError(e)
+            return
+        }
 
         reactApplicationContext.bindService(intent, object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName, binder: IBinder) {
-                bleService = (binder as CaroBleService.LocalBinder).getService()
-                isBound = true
-                onBound()
+                try {
+                    bleService = (binder as CaroBleService.LocalBinder).getService()
+                    isBound = true
+                    onBound()
+                } catch (e: Exception) {
+                    onError(e)
+                }
             }
 
             override fun onServiceDisconnected(name: ComponentName) {
