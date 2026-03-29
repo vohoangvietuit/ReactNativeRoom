@@ -1,17 +1,18 @@
-import React, {useCallback, useEffect, useRef} from 'react';
-import {View, StyleSheet, Alert} from 'react-native';
-import {useSafeAreaInsets} from 'react-native-safe-area-context';
-import {useCaroGame} from '../hooks/useCaroGame';
-import {GameBoard} from '../components/game/GameBoard';
-import {GameHUD} from '../components/game/GameHUD';
-import {GameOverModal} from '../components/game/GameOverModal';
-import {colors, spacing} from '../theme';
+import React, { useCallback, useEffect } from 'react';
+import { View, StyleSheet, Alert } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useCaroGame } from '../hooks/useCaroGame';
+import { GameBoard } from '../components/game/GameBoard';
+import { GameHUD } from '../components/game/GameHUD';
+import { GameOverModal } from '../components/game/GameOverModal';
+import { ReconnectingOverlay } from '../components/game/ReconnectingOverlay';
+import { colors, spacing } from '../theme';
 
 interface GameScreenProps {
   navigation: any;
 }
 
-export const GameScreen: React.FC<GameScreenProps> = ({navigation}) => {
+export const GameScreen: React.FC<GameScreenProps> = ({ navigation }) => {
   const insets = useSafeAreaInsets();
   const {
     board,
@@ -20,23 +21,25 @@ export const GameScreen: React.FC<GameScreenProps> = ({navigation}) => {
     lastMove,
     winningCells,
     isMyTurn,
-    isConnected,
+    opponentLeft,
+    isReconnecting,
+    gameCancelled,
     placeMove,
     stopGame,
+    cancelGame,
+    reconnect,
   } = useCaroGame();
 
   const isFinished = gameState.status === 'FINISHED';
+  // Allow moves even while reconnecting — moves are queued locally and flushed on reconnect.
   const disabled = !isMyTurn || isFinished;
 
-  // Track previous connection state to detect disconnect during gameplay
-  const wasConnected = useRef(false);
+  // Show alert when opponent explicitly disconnects mid-game
   useEffect(() => {
-    if (isConnected) {
-      wasConnected.current = true;
-    } else if (wasConnected.current && !isConnected && gameState.status === 'PLAYING') {
+    if (opponentLeft) {
       Alert.alert(
-        'Connection Lost',
-        'The other player has disconnected.',
+        'Opponent Left',
+        'Your opponent has disconnected. The game has ended.',
         [
           {
             text: 'Back to Menu',
@@ -45,11 +48,45 @@ export const GameScreen: React.FC<GameScreenProps> = ({navigation}) => {
               navigation.popToTop();
             },
           },
-          {text: 'Wait', style: 'cancel'},
         ],
+        { cancelable: false },
       );
     }
-  }, [isConnected, gameState.status, stopGame, navigation]);
+  }, [opponentLeft, stopGame, navigation]);
+
+  // Navigate back when either player cancels the game
+  useEffect(() => {
+    if (gameCancelled) {
+      navigation.popToTop();
+    }
+  }, [gameCancelled, navigation]);
+
+  const handleForfeit = useCallback(() => {
+    Alert.alert(
+      'Forfeit Game',
+      'Are you sure you want to forfeit? This will end the game for both players.',
+      [
+        { text: 'Stay' },
+        {
+          text: 'Forfeit',
+          style: 'destructive',
+          onPress: async () => {
+            await cancelGame();
+            navigation.popToTop();
+          },
+        },
+      ],
+    );
+  }, [cancelGame, navigation]);
+
+  const handleCancelReconnect = useCallback(async () => {
+    await cancelGame();
+    navigation.popToTop();
+  }, [cancelGame, navigation]);
+
+  const handleReconnect = useCallback(async () => {
+    await reconnect();
+  }, [reconnect]);
 
   const handleCellPress = useCallback(
     async (x: number, y: number) => {
@@ -65,7 +102,9 @@ export const GameScreen: React.FC<GameScreenProps> = ({navigation}) => {
   const handlePlayAgain = useCallback(() => {
     // In a real flow, host would reset and re-broadcast
     stopGame();
-    navigation.replace('Lobby', {role: gameState.myRole === 'host' ? 'host' : 'join'});
+    navigation.replace('Lobby', {
+      role: gameState.myRole === 'host' ? 'host' : 'join',
+    });
   }, [stopGame, navigation, gameState.myRole]);
 
   const handleBackToMenu = useCallback(() => {
@@ -74,7 +113,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({navigation}) => {
   }, [stopGame, navigation]);
 
   return (
-    <View style={[styles.container, {paddingTop: insets.top}]}>
+    <View style={[styles.container, { paddingTop: insets.top }]}>
       {/* HUD */}
       <GameHUD
         mySymbol={gameState.mySymbol}
@@ -83,6 +122,14 @@ export const GameScreen: React.FC<GameScreenProps> = ({navigation}) => {
         moveCount={moves.length}
         connectedPlayers={gameState.connectedPlayers}
         status={gameState.status}
+        onForfeit={handleForfeit}
+      />
+
+      {/* Non-blocking reconnect banner — sits above the board, doesn't block taps */}
+      <ReconnectingOverlay
+        visible={isReconnecting}
+        onReconnect={handleReconnect}
+        onCancel={handleCancelReconnect}
       />
 
       {/* Board */}

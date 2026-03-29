@@ -261,7 +261,7 @@ describe('Full Game Flow Integration', () => {
 
     // Wait for mount sync effect
     await act(async () => {
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await new Promise<void>(resolve => setTimeout(resolve, 100));
     });
 
     expect(result.current.gameState.status).toBe('PLAYING');

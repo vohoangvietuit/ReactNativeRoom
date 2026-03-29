@@ -34,6 +34,10 @@ interface CaroDao {
     @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insertMove(move: CaroMove)
 
+    // Insert a single move — silently ignore if cell already occupied (optimistic offline writes)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertMoveIgnore(move: CaroMove)
+
     // Bulk insert for full sync from host
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAll(moves: List<CaroMove>)

@@ -38,8 +38,10 @@ A **real-time multiplayer Caro game** (Gomoku — 5-in-a-row on a 15×15 board) 
   - **Host** — creates a game, advertises via BLE, plays as X
   - **Challenger** — scans for games, joins as O
 - **Real-time sync** — moves appear on both devices instantly via BLE GATT notifications with proper CCCD descriptor write sequencing
-- **Game state persistence** — all moves stored in Room database; game state re-hydrates on app navigation
+- **Game state persistence** — all moves stored in Room database (v2); game state re-hydrates on app navigation
 - **Proper serialization** — Boolean fields in native responses are properly typed (not string coercion)
+- **Offline move queue** — Challenger moves written to `pending_moves` table even when BLE is down; flushed to host on reconnect; board remains playable during disconnection
+- **Non-blocking reconnect** — Inline banner replaces blocking modal; board stays active during reconnect; Reconnect / Forfeit buttons available in gameplay
 - **Game history** — all moves stored in Room database, persist between sessions
 
 ### Complete Architecture
@@ -350,6 +352,103 @@ useEffect(() => {
 
 This ensures React state matches native reality, preventing WAITING when the game is PLAYING.
 
+### Design 4: Offline Move Queue with `pending_moves` Table
+
+**The Problem:**  
+Challenger's `placeMove` sent the move over BLE only. If the connection dropped mid-turn, the move was silently discarded. The board would appear updated locally but the host never received it.
+
+**The Solution:**  
+Write to two tables simultaneously — optimistic write + persistent queue:
+
+```kotlin
+// In CaroRepository
+suspend fun queueMove(move: CaroMove, gameId: String): Int = withContext(Dispatchers.IO) {
+    dao.insertMoveIgnore(move)          // instant UI update via Room observer
+    val pending = PendingMove(
+        x = move.x, y = move.y,
+        playerSymbol = move.playerSymbol,
+        gameId = gameId,
+        timestamp = System.currentTimeMillis()
+    )
+    pendingDao.insert(pending).toInt()  // returns the pending row ID
+}
+```
+
+In `CaroGameModule.placeMove()` (challenger path):
+
+```kotlin
+val pendingId = repo.queueMove(move, gameId)  // optimistic write + queue
+if (bleService?.isConnectedToHost() == true) {
+    bleService?.sendMoveToHost(move)       // immediate send if connected
+    if (pendingId > 0) repo.markMoveSynced(pendingId)
+}
+```
+
+On `MSG_RECONNECTED`, flush the queue in order:
+
+```kotlin
+// In CaroGameModule MSG_RECONNECTED handler
+moduleScope.launch {
+    val pending = repo.getPendingMoves()  // unsynced, ordered by timestamp
+    for (pm in pending) {
+        bleService?.sendMoveToHost(CaroMove(x = pm.x, y = pm.y, ...))
+        repo.markMoveSynced(pm.id)
+    }
+}
+```
+
+### Design 5: Non-Blocking Reconnect UX + Reconnect Routing Fix
+
+**The Problem (UX):**  
+`ReconnectingOverlay` was a full-screen `<Modal>` with a 20-second countdown blocking all interaction. During that window the board was completely inaccessible, even though moves were now safe to place (offline queue).
+
+**The Solution (UX):**  
+Replace with a plain `<View>` banner strip — zero overhead when hidden, non-blocking when visible:
+
+```tsx
+// ReconnectingOverlay — no Modal, no countdown
+export function ReconnectingOverlay({visible, onReconnect, onCancel}: Props) {
+  if (!visible) return null;
+  return (
+    <View style={styles.banner}>
+      <ActivityIndicator color="#fff" />
+      <Text style={styles.text}>Connection lost — moves are saved</Text>
+      <Button title="Reconnect" onPress={onReconnect} />
+      <Button title="Forfeit" onPress={onCancel} />
+    </View>
+  );
+}
+```
+
+In `GameScreen.tsx`, the `disabled` prop no longer includes `isReconnecting`:
+
+```tsx
+// Before: disabled={!isMyTurn || isFinished || isReconnecting}
+const disabled = !isMyTurn || isFinished;  // board always interactive on your turn
+```
+
+**The Problem (Routing):**  
+`MSG_RECONNECTED` was never actually sent by the host. Auto-reconnect triggered `SUBS_COMPLETE` → host always replied `AUTH_CHALLENGE` → challenger entered auth flow again, wiping the board.
+
+**The Solution (Routing):**  
+`MSG_SUBS_COMPLETE` handler checks the current session status:
+
+```kotlin
+message == BleConstants.MSG_SUBS_COMPLETE -> {
+    moduleScope.launch {
+        val session = repo.getSession(gameId)
+        if (session?.status == "PLAYING") {
+            // Reconnect path — do NOT re-auth, do NOT clear board
+            bleService?.broadcastControl(BleConstants.MSG_RECONNECTED)
+        } else {
+            // Normal new join — challenge the challenger
+            val requiresPass = if (passKeyHash.isNotEmpty()) "1" else "0"
+            bleService?.broadcastControl("${BleConstants.MSG_AUTH_CHALLENGE}:${gameId}:${requiresPass}")
+        }
+    }
+}
+```
+
 ---
 
 ## 4. Kotlin Fundamentals
@@ -530,6 +629,48 @@ data class GameSession(
 )
 ```
 
+### Entity 3: PendingMove (offline move queue)
+
+```kotlin
+// android/app/src/main/java/com/reactnativeroom/database/PendingMove.kt
+package com.reactnativeroom.database
+
+import androidx.room.ColumnInfo
+import androidx.room.Entity
+import androidx.room.Index
+import androidx.room.PrimaryKey
+
+@Entity(
+    tableName = "pending_moves",
+    indices = [Index(value = ["x", "y", "game_id"], unique = true)]
+)
+data class PendingMove(
+    @PrimaryKey(autoGenerate = true)
+    val id: Int = 0,
+    
+    @ColumnInfo(name = "x")
+    val x: Int,
+    
+    @ColumnInfo(name = "y")
+    val y: Int,
+    
+    @ColumnInfo(name = "player_symbol")
+    val playerSymbol: String,
+    
+    @ColumnInfo(name = "game_id")
+    val gameId: String,
+    
+    @ColumnInfo(name = "synced")
+    val synced: Int = 0,  // 0 = pending, 1 = synced
+    
+    @ColumnInfo(name = "timestamp")
+    val timestamp: Long = System.currentTimeMillis(),
+)
+```
+
+**Why a separate entity?**  
+`caro_moves` is the live board (Room observer drives UI). `pending_moves` is the delivery queue — it persists challenger moves that haven't been confirmed by the host so they can be retransmitted on reconnect.
+
 ### DAO: Query interface
 
 ```kotlin
@@ -566,6 +707,9 @@ interface CaroDao {
     @Insert
     suspend fun insertMove(move: CaroMove)
     
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertMoveIgnore(move: CaroMove)  // used for optimistic offline writes
+    
     @Insert
     suspend fun insertAll(moves: List<CaroMove>)
     
@@ -601,13 +745,14 @@ import androidx.room.RoomDatabase
 import android.content.Context
 
 @Database(
-    entities = [CaroMove::class, GameSession::class],
-    version = 1,
+    entities = [CaroMove::class, GameSession::class, PendingMove::class],
+    version = 2,
     exportSchema = false,  // can enable for production migrations
 )
 abstract class CaroDatabase : RoomDatabase() {
     
     abstract fun caroDao(): CaroDao
+    abstract fun pendingMoveDao(): PendingMoveDao
     
     companion object {
         @Volatile
@@ -745,6 +890,8 @@ import android.util.Log
 import com.reactnativeroom.database.CaroDao
 import com.reactnativeroom.database.CaroMove
 import com.reactnativeroom.database.GameSession
+import com.reactnativeroom.database.PendingMove
+import com.reactnativeroom.database.PendingMoveDao
 import com.reactnativeroom.game.WinChecker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -756,7 +903,8 @@ data class MoveResult(
     val isDraw: Boolean = false,
 )
 
-class CaroRepository(private val dao: CaroDao) {
+// Note: constructor now takes both DAOs
+class CaroRepository(private val dao: CaroDao, private val pendingDao: PendingMoveDao) {
     
     val observeMoves = dao.observeMoves()
     
@@ -862,12 +1010,46 @@ class CaroRepository(private val dao: CaroDao) {
     
     suspend fun clearAll() = withContext(Dispatchers.IO) {
         dao.clearMoves()
+        pendingDao.clearAll()  // also wipe the offline queue
     }
     
-    // For late joiners — receive full board state
-    suspend fun fullSync(moves: List<CaroMove>) = withContext(Dispatchers.IO) {
+    // For offline move queue (challenger side)
+    suspend fun queueMove(move: CaroMove, gameId: String): Int = withContext(Dispatchers.IO) {
+        dao.insertMoveIgnore(move)  // instant board update via Room observer
+        val pending = PendingMove(
+            x = move.x, y = move.y,
+            playerSymbol = move.playerSymbol,
+            gameId = gameId,
+            timestamp = System.currentTimeMillis()
+        )
+        pendingDao.insert(pending).toInt()
+    }
+    
+    suspend fun getPendingMoves(): List<PendingMove> = withContext(Dispatchers.IO) {
+        pendingDao.getUnsynced()
+    }
+    
+    suspend fun markMoveSynced(id: Int) = withContext(Dispatchers.IO) {
+        pendingDao.markSynced(id)
+    }
+    
+    // For late joiners — receive full board state; reconciles pending queue
+    suspend fun fullSync(confirmedMoves: List<CaroMove>) = withContext(Dispatchers.IO) {
         dao.clearMoves()
-        dao.insertAll(moves)
+        dao.insertAll(confirmedMoves)
+        // Mark pending moves that were already confirmed by host
+        val confirmedSet = confirmedMoves.map { "${it.x},${it.y}" }.toSet()
+        val unsynced = pendingDao.getUnsynced()
+        for (pm in unsynced) {
+            if ("${pm.x},${pm.y}" in confirmedSet) {
+                pendingDao.markSynced(pm.id)  // already on host — mark done
+            } else {
+                dao.insertMoveIgnore(  // re-insert unconfirmed pending move
+                    CaroMove(x = pm.x, y = pm.y, playerSymbol = pm.playerSymbol,
+                        moveNumber = confirmedMoves.size + 1)
+                )
+            }
+        }
     }
     
     private fun buildBoard(moves: List<CaroMove>): Array<IntArray> {
@@ -884,7 +1066,8 @@ class CaroRepository(private val dao: CaroDao) {
 - **Turn validation:** Ensures X and O alternate
 - **Win detection:** Builds board array, calls WinChecker
 - **State transitions:** WAITING → PLAYING → FINISHED
-- **Sync:** Full board sync for late joiners
+- **Offline queue:** `queueMove()` + `getPendingMoves()` + `markMoveSynced()` for challenger resilience
+- **Sync:** Full board sync with pending-move reconciliation for late joiners / reconnects
 
 ---
 
@@ -1440,21 +1623,8 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
 
     private val db by lazy { CaroDatabase.getInstance(reactApplicationContext) }
     private val dao by lazy { db.caroDao() }
-    private val repo by lazy { CaroRepository(dao) }
-
-    private var bleService: CaroBleService? = null
-    private var isBound = false
-
-    private var gameId = ""
-    private var myRole = ""      // "host" | "challenger" | "spectator"
-    private var mySymbol = ""    // "X" | "O" | ""
-    private var connectedPlayers = 0
-
-    // ─── Game Actions ───
-
-    @ReactMethod
-    fun placeMove(x: Double, y: Double, promise: Promise) {
-        moduleScope.launch {
+    private val pendingDao by lazy { db.pendingMoveDao() }
+    private val repo by lazy { CaroRepository(dao, pendingDao) }  // v2: both DAOs
             try {
                 val ix = x.toInt()
                 val iy = y.toInt()
@@ -1479,17 +1649,22 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
                     }
                     promise.resolve(serializeMoveResult(result))
                 } else if (myRole == "challenger") {
+                    // Optimistic write — updates board immediately via Room observer
+                    // also queues in pending_moves for offline resilience
                     val moveCount = repo.getMoveCount()
                     val move = com.reactnativeroom.database.CaroMove(
                         x = ix, y = iy,
                         playerSymbol = mySymbol,
                         moveNumber = moveCount + 1
                     )
-                    bleService?.sendMoveToHost(move)
-                    promise.resolve(Json.encodeToString(mapOf(
-                        "success" to "true",
-                        "isWin" to "false",
-                        "isDraw" to "false"
+                    val pendingId = repo.queueMove(move, gameId)
+                    if (bleService?.isConnectedToHost() == true) {
+                        bleService?.sendMoveToHost(move)
+                        if (pendingId > 0) repo.markMoveSynced(pendingId)
+                    }
+                    // Result reflects local optimistic state
+                    promise.resolve(Json.encodeToString(PlaceMoveResponse(
+                        success = true, isWin = false, isDraw = false
                     )))
                 }
             } catch (e: Exception) {
@@ -1610,6 +1785,12 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
         gameId = ""
         connectedPlayers = 0
         unbindBleService()
+    }
+
+    @ReactMethod
+    fun reconnect(promise: Promise) {
+        bleService?.reconnect()  // user-triggered one-shot reconnect attempt
+        promise.resolve(null)
     }
 
     // ─── BLE Service Binding ───
@@ -1973,6 +2154,13 @@ export function useCaroGame() {
     setLastMoveResult(null);
   }, []);
 
+  const reconnect = useCallback(async () => {
+    if (!CaroGame) return;
+    try {
+      await CaroGame.reconnect();
+    } catch {}
+  }, []);
+
   return {
     board,
     moves,
@@ -1987,6 +2175,7 @@ export function useCaroGame() {
     joinGame,
     startMatch,
     stopGame,
+    reconnect,
     refreshBoard,
     refreshGameState,
   };
@@ -2153,10 +2342,19 @@ export function GameScreen(): React.ReactElement {
         contentContainerStyle={{flexGrow: 1}}
         scrollEnabled={false}>
         <GameHUD gameState={caro.gameState} isMyTurn={caro.isMyTurn} />
+
+        {/* Non-blocking inline banner — does NOT block board interaction */}
+        <ReconnectingOverlay
+          visible={caro.gameState.isReconnecting}
+          onReconnect={caro.reconnect}
+          onCancel={caro.stopGame}
+        />
+
         <GameBoard
           board={caro.board}
           onCellPress={handleCellPress}
-          disabled={!caro.isMyTurn}
+          // isReconnecting intentionally removed — board stays active during reconnect
+          disabled={!caro.isMyTurn || caro.gameState.status === 'FINISHED'}
           lastMove={caro.lastMove}
           winningCells={caro.winningCells}
         />
@@ -2408,13 +2606,14 @@ Layer 3: Kotlin Logic
 ## Conclusion
 
 You've now built a **real-time multiplayer game** that demonstrates:
-- ✓ Room database for persistence
+- ✓ Room database v2 with offline move queue (`pending_moves` table)
 - ✓ Kotlin coroutines for async/concurrent operations
 - ✓ BLE GATT for device-to-device sync (no internet)
 - ✓ Game logic with win detection
 - ✓ React Native bridge for JS ↔ Kotlin communication
 - ✓ Beautiful responsive UI with React Navigation
-- ✓ Spectator mode for observers
+- ✓ Offline move queue with automatic sync on reconnect
+- ✓ Non-blocking reconnect UX — board stays interactive during BLE disconnect
 - ✓ Turn-based validation and state management
 
-Next steps: Test on real devices (BLE requires physical phones), add player names in auth flow, persist game history, and add replay mode.
+Next steps: Test on real devices (BLE requires physical phones), add player names in auth flow, persist game history across sessions, and add replay mode.

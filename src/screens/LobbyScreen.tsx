@@ -1,4 +1,4 @@
-import React, {useEffect, useRef, useCallback} from 'react';
+import React, { useEffect, useRef, useCallback, useState } from 'react';
 import {
   View,
   Text,
@@ -7,33 +7,49 @@ import {
   Easing,
   Platform,
   PermissionsAndroid,
+  Modal,
+  TextInput,
+  TouchableOpacity,
+  Alert,
+  Linking,
 } from 'react-native';
-import {useSafeAreaInsets} from 'react-native-safe-area-context';
-import {useCaroGame} from '../hooks/useCaroGame';
-import {Button} from '../components/ui/Button';
-import {Card} from '../components/ui/Card';
-import {Badge} from '../components/ui/Badge';
-import {colors, spacing, fontSize} from '../theme';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useCaroGame } from '../hooks/useCaroGame';
+import { Button } from '../components/ui/Button';
+import { Card } from '../components/ui/Card';
+import { Badge } from '../components/ui/Badge';
+import { colors, spacing, fontSize, borderRadius } from '../theme';
 
 interface LobbyScreenProps {
   navigation: any;
-  route: {params: {role: 'host' | 'join'}};
+  route: { params: { role: 'host' | 'join'; passKey?: string } };
 }
 
-export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => {
+export const LobbyScreen: React.FC<LobbyScreenProps> = ({
+  navigation,
+  route,
+}) => {
   const insets = useSafeAreaInsets();
-  const {role} = route.params;
+  const { role, passKey: routePassKey } = route.params;
   const {
     gameState,
     loading,
     error,
+    authRequired,
+    authFailed,
     startHosting,
     joinGame,
     startMatch,
     stopGame,
+    setReady,
+    cancelGame,
+    submitPassKey,
   } = useCaroGame();
 
   const pulseAnim = useRef(new Animated.Value(1)).current;
+  const [passKeyInput, setPassKeyInput] = useState('');
+  const [passKeyError, setPassKeyError] = useState('');
+  const [readySent, setReadySent] = useState(false);
 
   useEffect(() => {
     Animated.loop(
@@ -65,7 +81,18 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
           buttonPositive: 'Allow',
         },
       );
-      return loc === PermissionsAndroid.RESULTS.GRANTED;
+      if (loc !== PermissionsAndroid.RESULTS.GRANTED) return false;
+      // On API < 31, BLE scanning also requires Location Services (GPS) to be ON.
+      // We can only warn the user — the OS does not expose a JS API to check directly.
+      Alert.alert(
+        'Location Services Required',
+        'Please ensure Location Services (GPS) is enabled in Settings for Bluetooth scanning to work.',
+        [
+          { text: 'Open Settings', onPress: () => Linking.openSettings() },
+          { text: 'Continue', style: 'cancel' },
+        ],
+      );
+      return true;
     }
     const results = await PermissionsAndroid.requestMultiple([
       PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
@@ -79,32 +106,61 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
 
   useEffect(() => {
     const init = async () => {
-      // Request BLE permissions before starting BLE operations.
-      // Even if denied, we still call startHosting/joinGame so the native
-      // side rejects with a descriptive error that surfaces in the UI.
       await requestBlePermissions();
       if (role === 'host') {
-        await startHosting('Player').catch(() => {});
+        await startHosting('Player', routePassKey ?? '').catch(() => {});
       } else {
         await joinGame('Player').catch(() => {});
       }
     };
     init();
-  }, [role, startHosting, joinGame, requestBlePermissions]);
+  }, [role, routePassKey, startHosting, joinGame, requestBlePermissions]);
 
-  // Navigate to game when match starts
+  // Navigate to game when match starts (challenger waits for GAME_START event → status = PLAYING)
   useEffect(() => {
     if (gameState.status === 'PLAYING') {
       navigation.replace('Game');
     }
   }, [gameState.status, navigation]);
 
-  const handleLeave = () => {
+  // Show error if auth permanently fails (challenger kicked)
+  useEffect(() => {
+    if (authFailed) {
+      setPassKeyError('Wrong passkey — access denied.');
+    }
+  }, [authFailed]);
+
+  const handleLeave = useCallback(() => {
     stopGame();
     navigation.goBack();
-  };
+  }, [stopGame, navigation]);
 
-  const canStart = role === 'host' && gameState.connectedPlayers > 0;
+  const handleCancel = useCallback(async () => {
+    await cancelGame();
+    navigation.popToTop();
+  }, [cancelGame, navigation]);
+
+  const handleReady = useCallback(async () => {
+    await setReady();
+    setReadySent(true);
+  }, [setReady]);
+
+  const handleSubmitPassKey = useCallback(async () => {
+    if (!passKeyInput.trim()) {
+      setPassKeyError('Please enter the passkey.');
+      return;
+    }
+    setPassKeyError('');
+    await submitPassKey(passKeyInput.trim());
+    setPassKeyInput('');
+  }, [submitPassKey, passKeyInput]);
+
+  // Host: can start once challenger is ready
+  const canStart = role === 'host' && gameState.challengerReady === true;
+  // Host: challenger connected but not yet ready
+  const challengerConnected = role === 'host' && gameState.connectedPlayers > 0;
+
+  const hasPassKey = !!routePassKey;
 
   return (
     <View style={[styles.container, { paddingTop: insets.top + spacing.md }]}>
@@ -118,7 +174,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
         ) : null}
       </View>
 
-      {/* Error state — shown instead of lobby UI when BLE fails */}
+      {/* Error state */}
       {error ? (
         <View style={styles.errorCard}>
           <Text style={styles.errorIcon}>⚠️</Text>
@@ -138,7 +194,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
         </View>
       ) : (
         <>
-          {/* Scanning animation */}
+          {/* Scanning / advertising animation */}
           <View style={styles.scanArea}>
             <Animated.View
               style={[
@@ -147,7 +203,9 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
               ]}
             />
             <View style={styles.scanCircleInner}>
-              <Text style={styles.scanIcon}>{role === 'host' ? '📡' : '🔍'}</Text>
+              <Text style={styles.scanIcon}>
+                {role === 'host' ? '📡' : '🔍'}
+              </Text>
             </View>
             <Text style={styles.scanText}>
               {loading
@@ -155,25 +213,39 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
                   ? 'Starting BLE advertising...'
                   : 'Scanning for nearby games...'
                 : role === 'host'
-                ? 'Waiting for players to join...'
+                ? challengerConnected
+                  ? 'Challenger connected — waiting for ready...'
+                  : 'Waiting for players to join...'
+                : gameState.connectedPlayers > 0
+                ? 'Connected to host!'
                 : 'Looking for host...'}
             </Text>
+            {hasPassKey && role === 'host' && (
+              <Badge text="🔒 Password Protected" variant="default" />
+            )}
           </View>
 
-          {/* Connected players */}
+          {/* Players card */}
           <Card style={styles.playersCard}>
             <Text style={styles.sectionTitle}>Connected Players</Text>
             <View style={styles.playersList}>
-              {/* Host (always shown) */}
+              {/* Host row */}
               <View style={styles.playerRow}>
                 <View style={[styles.playerDot, styles.dotConnected]} />
-                <Text style={styles.playerName}>
-                  {role === 'host' ? 'You (Host)' : 'Host'}
-                </Text>
+                <View style={styles.playerInfo}>
+                  <Text style={styles.playerName}>
+                    {role === 'host' ? 'You (Host)' : 'Host'}
+                  </Text>
+                  {role === 'join' && gameState.hostDeviceId ? (
+                    <Text style={styles.deviceId} numberOfLines={1}>
+                      {gameState.hostDeviceId}
+                    </Text>
+                  ) : null}
+                </View>
                 <Badge text="X" variant="playerX" />
               </View>
 
-              {/* Challenger slot */}
+              {/* Challenger row */}
               <View style={styles.playerRow}>
                 <View
                   style={[
@@ -183,15 +255,27 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
                       : styles.dotWaiting,
                   ]}
                 />
-                <Text style={styles.playerName}>
-                  {gameState.connectedPlayers > 0
-                    ? role === 'join'
-                      ? 'You (Challenger)'
-                      : 'Challenger'
-                    : 'Waiting for challenger...'}
-                </Text>
+                <View style={styles.playerInfo}>
+                  <Text style={styles.playerName}>
+                    {gameState.connectedPlayers > 0
+                      ? role === 'join'
+                        ? 'You (Challenger)'
+                        : gameState.challengerDeviceName || 'Challenger'
+                      : 'Waiting for challenger...'}
+                  </Text>
+                  {role === 'host' && gameState.challengerDeviceId ? (
+                    <Text style={styles.deviceId} numberOfLines={1}>
+                      {gameState.challengerDeviceId}
+                    </Text>
+                  ) : null}
+                </View>
                 {gameState.connectedPlayers > 0 && (
-                  <Badge text="O" variant="playerO" />
+                  <View style={styles.badgeRow}>
+                    <Badge text="O" variant="playerO" />
+                    {gameState.challengerReady && (
+                      <Badge text="Ready ✓" variant="success" />
+                    )}
+                  </View>
                 )}
               </View>
             </View>
@@ -201,7 +285,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
           <View style={styles.actions}>
             {role === 'host' && (
               <Button
-                title="Start Match"
+                title={canStart ? 'Start Match' : 'Waiting for Ready...'}
                 onPress={startMatch}
                 variant="primary"
                 size="lg"
@@ -210,9 +294,23 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
                 style={styles.actionButton}
               />
             )}
+
+            {role === 'join' &&
+              gameState.connectedPlayers > 0 &&
+              !authRequired && (
+                <Button
+                  title={readySent ? 'Ready ✓' : 'Ready'}
+                  onPress={handleReady}
+                  variant="primary"
+                  size="lg"
+                  disabled={readySent}
+                  style={styles.actionButton}
+                />
+              )}
+
             <Button
-              title="Leave"
-              onPress={handleLeave}
+              title={role === 'host' ? 'Cancel Hosting' : 'Leave'}
+              onPress={handleCancel}
               variant="outline"
               size="md"
               style={styles.actionButton}
@@ -220,6 +318,83 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({navigation, route}) => 
           </View>
         </>
       )}
+
+      {/* Passkey modal — shown to challenger when host requires auth */}
+      <Modal
+        visible={authRequired && !authFailed}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {}}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Passkey Required</Text>
+            <Text style={styles.modalSubtitle}>
+              The host has protected this game. Enter the passkey to continue.
+            </Text>
+            {passKeyError ? (
+              <Text style={styles.passKeyError}>{passKeyError}</Text>
+            ) : null}
+            <TextInput
+              style={styles.passkeyInput}
+              placeholder="Enter passkey"
+              placeholderTextColor={colors.textMuted}
+              value={passKeyInput}
+              onChangeText={text => {
+                setPassKeyInput(text);
+                setPassKeyError('');
+              }}
+              secureTextEntry
+              autoCapitalize="none"
+            />
+            <View style={styles.modalButtons}>
+              <TouchableOpacity
+                style={[styles.modalBtn, styles.modalBtnCancel]}
+                onPress={() => {
+                  Alert.alert('Cancel', 'Leave the game?', [
+                    { text: 'Stay' },
+                    { text: 'Leave', onPress: handleCancel },
+                  ]);
+                }}
+              >
+                <Text style={styles.modalBtnText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.modalBtn, styles.modalBtnConfirm]}
+                onPress={handleSubmitPassKey}
+              >
+                <Text style={[styles.modalBtnText, styles.modalBtnConfirmText]}>
+                  Submit
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Auth fail overlay */}
+      <Modal
+        visible={authFailed}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {}}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.errorIcon}>🔒</Text>
+            <Text style={styles.modalTitle}>Access Denied</Text>
+            <Text style={styles.modalSubtitle}>
+              Incorrect passkey. You have been disconnected from this game.
+            </Text>
+            <Button
+              title="Go Back"
+              onPress={handleCancel}
+              variant="primary"
+              size="md"
+            />
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 };
@@ -271,6 +446,7 @@ const styles = StyleSheet.create({
     marginTop: spacing.md,
     fontSize: fontSize.md,
     color: colors.textSecondary,
+    textAlign: 'center',
   },
   playersCard: {
     marginBottom: spacing.lg,
@@ -300,10 +476,22 @@ const styles = StyleSheet.create({
   dotWaiting: {
     backgroundColor: colors.textMuted,
   },
-  playerName: {
+  playerInfo: {
     flex: 1,
+  },
+  playerName: {
     fontSize: fontSize.md,
     color: colors.textPrimary,
+  },
+  deviceId: {
+    fontSize: fontSize.xs,
+    color: colors.textMuted,
+    fontFamily: 'monospace',
+    marginTop: 2,
+  },
+  badgeRow: {
+    flexDirection: 'row',
+    gap: spacing.xs,
   },
   actions: {
     marginTop: 'auto',
@@ -347,5 +535,75 @@ const styles = StyleSheet.create({
   },
   errorButton: {
     alignSelf: 'center',
+  },
+  // Passkey modal
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: spacing.xl,
+  },
+  modalCard: {
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.lg,
+    padding: spacing.xl,
+    width: '100%',
+    alignItems: 'center',
+  },
+  modalTitle: {
+    fontSize: fontSize.xl,
+    fontWeight: '800',
+    color: colors.textPrimary,
+    marginBottom: spacing.xs,
+    alignSelf: 'flex-start',
+  },
+  modalSubtitle: {
+    fontSize: fontSize.sm,
+    color: colors.textSecondary,
+    marginBottom: spacing.lg,
+    alignSelf: 'flex-start',
+  },
+  passKeyError: {
+    fontSize: fontSize.sm,
+    color: '#ef4444',
+    marginBottom: spacing.sm,
+    alignSelf: 'flex-start',
+  },
+  passkeyInput: {
+    width: '100%',
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: borderRadius.md,
+    padding: spacing.md,
+    color: colors.textPrimary,
+    fontSize: fontSize.md,
+    marginBottom: spacing.lg,
+  },
+  modalButtons: {
+    flexDirection: 'row',
+    gap: spacing.md,
+    width: '100%',
+  },
+  modalBtn: {
+    flex: 1,
+    paddingVertical: spacing.sm,
+    borderRadius: borderRadius.md,
+    alignItems: 'center',
+  },
+  modalBtnCancel: {
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  modalBtnConfirm: {
+    backgroundColor: colors.primary,
+  },
+  modalBtnText: {
+    fontSize: fontSize.md,
+    fontWeight: '600',
+    color: colors.textSecondary,
+  },
+  modalBtnConfirmText: {
+    color: colors.background,
   },
 });

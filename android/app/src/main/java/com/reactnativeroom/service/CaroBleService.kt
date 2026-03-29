@@ -5,13 +5,16 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.bluetooth.*
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -38,7 +41,7 @@ class CaroBleService : Service() {
 
     // GATT Server (Host mode)
     private var gattServer: BluetoothGattServer? = null
-    private val connectedDevices = mutableSetOf<BluetoothDevice>()
+    private val connectedDevices = java.util.concurrent.ConcurrentHashMap.newKeySet<BluetoothDevice>()
     private var challengerDevice: BluetoothDevice? = null
     private var isHosting = false
 
@@ -50,11 +53,29 @@ class CaroBleService : Service() {
     var repository: CaroRepository? = null
     var gameId: String = ""
 
+    // Set to true while a game is in progress (used for reconnect logic)
+    var isGamePlaying = false
+
     // Callbacks — set by the TurboModule to push events to JS
     var onMoveReceived: ((CaroMove) -> Unit)? = null
-    var onPlayerConnected: ((String) -> Unit)? = null // role: "challenger" | "spectator"
+    var onPlayerConnected: ((role: String, deviceId: String, deviceName: String) -> Unit)? = null
     var onPlayerDisconnected: (() -> Unit)? = null
     var onGameControlMessage: ((String) -> Unit)? = null
+
+    // Heartbeat (host sends every 5 s while game is playing)
+    private var heartbeatJob: Job? = null
+
+    // Watchdog (joiner fires PLAYER_LEFT if no HEARTBEAT for 20 s)
+    private val watchdogHandler = Handler(Looper.getMainLooper())
+    private val watchdogRunnable = Runnable {
+        Log.w(TAG, "Heartbeat watchdog expired — treating as host disconnect")
+        onGameControlMessage?.invoke("PLAYER_LEFT")
+        onPlayerDisconnected?.invoke()
+    }
+
+    // Last host device seen — used for auto-reconnect
+    private var lastHostDevice: BluetoothDevice? = null
+    private var reconnectJob: Job? = null
 
     inner class LocalBinder : Binder() {
         fun getService(): CaroBleService = this@CaroBleService
@@ -140,13 +161,31 @@ class CaroBleService : Service() {
 
     fun stopHosting() {
         if (!isHosting) return
+        stopHeartbeat()
         adapter.bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback)
         gattServer?.close()
         gattServer = null
         connectedDevices.clear()
         challengerDevice = null
         isHosting = false
+        isGamePlaying = false
         Log.d(TAG, "Host stopped")
+    }
+
+    /** Start sending HEARTBEAT to all clients every 5 seconds. Call after GAME_START. */
+    fun startHeartbeat() {
+        stopHeartbeat()
+        heartbeatJob = scope.launch {
+            while (isActive && isGamePlaying) {
+                delay(5_000)
+                if (isGamePlaying) broadcastControl(BleConstants.MSG_HEARTBEAT)
+            }
+        }
+    }
+
+    fun stopHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
     }
 
     private val advertiseCallback = object : AdvertiseCallback() {
@@ -219,12 +258,15 @@ class CaroBleService : Service() {
                 connectedDevices.add(device)
                 val role = if (challengerDevice == null) "challenger" else "spectator"
                 if (role == "challenger") challengerDevice = device
-                onPlayerConnected?.invoke(role)
+                val name = device.name ?: device.address
+                onPlayerConnected?.invoke(role, device.address, name)
                 Log.d(TAG, "Device connected as $role: ${device.address}")
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 connectedDevices.remove(device)
                 if (device == challengerDevice) {
                     challengerDevice = null
+                    // Notify any remaining connected devices that the challenger left
+                    broadcastControl("PLAYER_LEFT")
                 }
                 onPlayerDisconnected?.invoke()
                 Log.d(TAG, "Device disconnected: ${device.address}")
@@ -275,6 +317,8 @@ class CaroBleService : Service() {
                                 // Broadcast to all connected clients (including challenger confirmation)
                                 broadcastMove(move)
                                 onMoveReceived?.invoke(move)
+                            } else {
+                                Log.e(TAG, "Host rejected move ${move.x},${move.y} from ${device.address}: ${result?.error}")
                             }
                         } catch (e: Exception) {
                             Log.e(TAG, "Failed to process remote move", e)
@@ -318,13 +362,24 @@ class CaroBleService : Service() {
     fun broadcastMove(move: CaroMove) {
         val json = Json.encodeToString(move)
         val bytes = json.toByteArray(Charsets.UTF_8)
-        val notifyChar = gattServer
-            ?.getService(BleConstants.CARO_SERVICE_UUID)
+        val server = gattServer ?: return
+        val notifyChar = server
+            .getService(BleConstants.CARO_SERVICE_UUID)
             ?.getCharacteristic(BleConstants.MOVE_NOTIFY_CHAR_UUID) ?: return
 
-        notifyChar.value = bytes
         connectedDevices.forEach { device ->
-            gattServer?.notifyCharacteristicChanged(device, notifyChar, false)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    server.notifyCharacteristicChanged(device, notifyChar, false, bytes)
+                } else {
+                    @Suppress("DEPRECATION")
+                    notifyChar.value = bytes
+                    @Suppress("DEPRECATION")
+                    server.notifyCharacteristicChanged(device, notifyChar, false)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to send move to ${device.address}", e)
+            }
         }
         Log.d(TAG, "Broadcast move to ${connectedDevices.size} devices")
     }
@@ -334,22 +389,64 @@ class CaroBleService : Service() {
      */
     fun broadcastControl(message: String) {
         val bytes = message.toByteArray(Charsets.UTF_8)
-        val controlChar = gattServer
-            ?.getService(BleConstants.CARO_SERVICE_UUID)
+        val server = gattServer ?: return
+        val controlChar = server
+            .getService(BleConstants.CARO_SERVICE_UUID)
             ?.getCharacteristic(BleConstants.GAME_CONTROL_CHAR_UUID) ?: return
 
-        controlChar.value = bytes
         connectedDevices.forEach { device ->
-            gattServer?.notifyCharacteristicChanged(device, controlChar, false)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    server.notifyCharacteristicChanged(device, controlChar, false, bytes)
+                } else {
+                    @Suppress("DEPRECATION")
+                    controlChar.value = bytes
+                    @Suppress("DEPRECATION")
+                    server.notifyCharacteristicChanged(device, controlChar, false)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to send control message to ${device.address}", e)
+            }
         }
     }
 
     fun getConnectedCount(): Int = connectedDevices.size
     fun hasChallengerConnected(): Boolean = challengerDevice != null
+    /** True when the GATT client has an active connection to a host. */
+    fun isConnectedToHost(): Boolean = isJoined
+
+    /** Disconnects (bans) the current challenger from the GATT server. */
+    fun disconnectChallenger() {
+        challengerDevice?.let { dev ->
+            gattServer?.cancelConnection(dev)
+        }
+    }
+
+    /**
+     * Manually trigger a reconnect attempt to the last known host.
+     * Called by the user tapping the "Reconnect" button in the UI.
+     * If already joined, does nothing. Cancels any in-flight reconnect job and
+     * starts a fresh one-shot attempt (no retry loop — user can tap again).
+     */
+    fun reconnect() {
+        if (isJoined) return
+        val host = lastHostDevice ?: return
+        reconnectJob?.cancel()
+        reconnectJob = null
+        scope.launch {
+            Log.d(TAG, "Manual reconnect attempt to ${host.address}")
+            val prev = clientGatt
+            prev?.close()
+            clientGatt = host.connectGatt(this@CaroBleService, false, clientGattCallback)
+        }
+    }
 
     // ══════════════════════════════════════════════════════════════════════
     // JOIN MODE — GATT Client
     // ══════════════════════════════════════════════════════════════════════
+
+    // Hold a reference so stopScanning can cancel the same scan
+    private var activeScanCallback: ScanCallback? = null
 
     fun startScanning(onDeviceFound: (BluetoothDevice) -> Unit) {
         val filter = ScanFilter.Builder()
@@ -364,30 +461,82 @@ class CaroBleService : Service() {
             .bluetoothLeScanner
             ?: throw UnsupportedOperationException("BLE scanning is not supported on this device or emulator")
 
-        leScanner.startScan(
-            listOf(filter), settings,
-            object : ScanCallback() {
-                override fun onScanResult(callbackType: Int, result: ScanResult) {
-                    onDeviceFound(result.device)
-                }
+        val cb = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                onDeviceFound(result.device)
             }
-        )
+        }
+        activeScanCallback = cb
+        leScanner.startScan(listOf(filter), settings, cb)
         Log.d(TAG, "Started scanning for Caro games")
     }
 
     fun stopScanning() {
-        adapter?.bluetoothLeScanner?.stopScan(object : ScanCallback() {})
+        val cb = activeScanCallback ?: return
+        adapter?.bluetoothLeScanner?.stopScan(cb)
+        activeScanCallback = null
+        Log.d(TAG, "Stopped scanning")
     }
 
     fun connectToHost(device: BluetoothDevice) {
+        lastHostDevice = device
         clientGatt = device.connectGatt(this, false, clientGattCallback)
     }
 
     fun disconnectFromHost() {
+        reconnectJob?.cancel()
+        reconnectJob = null
+        watchdogHandler.removeCallbacks(watchdogRunnable)
         clientGatt?.disconnect()
         clientGatt?.close()
         clientGatt = null
         isJoined = false
+        isGamePlaying = false
+    }
+
+    /**
+     * Challenger sends a game control message to the host via WRITE on GAME_CONTROL char.
+     */
+    fun sendControlToHost(message: String) {
+        val bytes = message.toByteArray(Charsets.UTF_8)
+        enqueueGattOp {
+            val gatt = clientGatt
+            val controlChar = gatt
+                ?.getService(BleConstants.CARO_SERVICE_UUID)
+                ?.getCharacteristic(BleConstants.GAME_CONTROL_CHAR_UUID)
+            if (gatt != null && controlChar != null) {
+                val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeCharacteristic(
+                        controlChar, bytes,
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    ) == BluetoothStatusCodes.SUCCESS
+                } else {
+                    @Suppress("DEPRECATION")
+                    controlChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    @Suppress("DEPRECATION")
+                    controlChar.value = bytes
+                    @Suppress("DEPRECATION")
+                    gatt.writeCharacteristic(controlChar) == true
+                }
+                if (!ok) {
+                    Log.e(TAG, "writeCharacteristic failed for control message: $message")
+                    onGattOpComplete()
+                }
+                // else: onCharacteristicWrite callback will call onGattOpComplete()
+            } else {
+                onGattOpComplete()
+            }
+        }
+    }
+
+    /** Start the heartbeat watchdog (reset every time a HEARTBEAT is received). */
+    fun resetWatchdog() {
+        watchdogHandler.removeCallbacks(watchdogRunnable)
+        if (isGamePlaying) watchdogHandler.postDelayed(watchdogRunnable, 20_000)
+    }
+
+    fun stopWatchdog() {
+        watchdogHandler.removeCallbacks(watchdogRunnable)
     }
 
     /**
@@ -396,56 +545,161 @@ class CaroBleService : Service() {
     fun sendMoveToHost(move: CaroMove) {
         val json = Json.encodeToString(move)
         val bytes = json.toByteArray(Charsets.UTF_8)
-
-        val writeChar = clientGatt
-            ?.getService(BleConstants.CARO_SERVICE_UUID)
-            ?.getCharacteristic(BleConstants.MOVE_WRITE_CHAR_UUID) ?: return
-
-        writeChar.value = bytes
-        clientGatt?.writeCharacteristic(writeChar)
-        Log.d(TAG, "Sent move to host: (${ move.x}, ${move.y})")
+        enqueueGattOp {
+            val gatt = clientGatt
+            val writeChar = gatt
+                ?.getService(BleConstants.CARO_SERVICE_UUID)
+                ?.getCharacteristic(BleConstants.MOVE_WRITE_CHAR_UUID)
+            if (gatt != null && writeChar != null) {
+                val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeCharacteristic(
+                        writeChar, bytes,
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    ) == BluetoothStatusCodes.SUCCESS
+                } else {
+                    @Suppress("DEPRECATION")
+                    writeChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    @Suppress("DEPRECATION")
+                    writeChar.value = bytes
+                    @Suppress("DEPRECATION")
+                    gatt.writeCharacteristic(writeChar) == true
+                }
+                if (ok) {
+                    Log.d(TAG, "Sent move to host: (${move.x}, ${move.y})")
+                } else {
+                    Log.e(TAG, "writeCharacteristic failed for move: (${move.x}, ${move.y})")
+                    onGattOpComplete()
+                }
+            } else {
+                onGattOpComplete()
+            }
+        }
     }
 
     // Pending GATT operations queue — Android BLE allows only one at a time
     private val pendingGattOps = java.util.concurrent.ConcurrentLinkedQueue<() -> Unit>()
-    private var gattBusy = false
+    @Volatile private var gattBusy = false
+    private var gattTimeoutJob: Job? = null
 
     private fun enqueueGattOp(op: () -> Unit) {
         pendingGattOps.add(op)
         drainGattQueue()
     }
 
+    private var currentGattOpId = 0L
+
     private fun drainGattQueue() {
-        if (gattBusy) return
-        val next = pendingGattOps.poll() ?: return
-        gattBusy = true
-        next()
+        synchronized(pendingGattOps) {
+            if (gattBusy) return
+            val next = pendingGattOps.poll() ?: return
+            gattBusy = true
+            
+            val opId = ++currentGattOpId
+            gattTimeoutJob?.cancel()
+            gattTimeoutJob = scope.launch {
+                delay(2000)
+                if (currentGattOpId == opId) {
+                    Log.w(TAG, "GATT queue operation timed out! Recovering queue...")
+                    onGattOpComplete()
+                }
+            }
+            
+            try {
+                next()
+            } catch (e: Exception) {
+                Log.e(TAG, "GATT operation failed with exception", e)
+                gattBusy = false
+                Handler(Looper.getMainLooper()).post { drainGattQueue() }
+            }
+        }
     }
 
     private fun onGattOpComplete() {
-        gattBusy = false
-        drainGattQueue()
+        gattTimeoutJob?.cancel()
+        synchronized(pendingGattOps) {
+            gattBusy = false
+        }
+        // Use post to avoid nested locks
+        Handler(Looper.getMainLooper()).post { drainGattQueue() }
     }
 
-    private val clientGattCallback = object : BluetoothGattCallback() {
+    private val clientGattCallback: BluetoothGattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                gatt.requestMtu(BleConstants.MTU_SIZE)
+                reconnectJob?.cancel()
+                reconnectJob = null
+                gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                 isJoined = true
-                Log.d(TAG, "Connected to host")
+                Log.d(TAG, "Connected to host, requesting MTU...")
+                
+                // Some Android devices fail or ignore requestMtu, which halts the whole process.
+                // We request MTU, but also set a timeout to force discoverServices if it hangs.
+                val mtuRequested = gatt.requestMtu(BleConstants.MTU_SIZE)
+                if (!mtuRequested) {
+                    Log.w(TAG, "requestMtu returned false, proceeding to discoverServices directly.")
+                    scope.launch {
+                        delay(600)
+                        gatt.discoverServices()
+                    }
+                } else {
+                    scope.launch {
+                        delay(2000)
+                        // If onMtuChanged didn't complete, it's safe to call discoverServices anyway
+                        Log.w(TAG, "MTU callback timeout, proceeding to discoverServices.")
+                        try {
+                            gatt.discoverServices()
+                        } catch (e: Exception) { }
+                    }
+                }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 isJoined = false
                 pendingGattOps.clear()
                 gattBusy = false
-                onPlayerDisconnected?.invoke()
+                stopWatchdog()
+                if (isGamePlaying) {
+                    // Try to reconnect up to 3 times before giving up
+                    val hostDevice = lastHostDevice
+                    if (hostDevice != null) {
+                        reconnectJob = scope.launch {
+                            onGameControlMessage?.invoke(BleConstants.MSG_RECONNECTING)
+                            var retrys = 0
+                            while (retrys < 3 && isActive) {
+                                retrys++
+                                Log.d(TAG, "Reconnect attempt $retrys/3")
+                                delay(5_000)
+                                val prevGatt: BluetoothGatt? = this@CaroBleService.clientGatt
+                                prevGatt?.close()
+                                @Suppress("DEPRECATION")
+                                val newGatt: BluetoothGatt = hostDevice.connectGatt(
+                                    this@CaroBleService, false, clientGattCallback
+                                )
+                                this@CaroBleService.clientGatt = newGatt
+                                // Wait for onConnectionStateChange to cancel this job
+                                delay(6_000)
+                                if (isJoined) return@launch
+                            }
+                            // All retries exhausted
+                            if (!isJoined) {
+                                onGameControlMessage?.invoke("PLAYER_LEFT")
+                                onPlayerDisconnected?.invoke()
+                            }
+                        }
+                    } else {
+                        onGameControlMessage?.invoke("PLAYER_LEFT")
+                        onPlayerDisconnected?.invoke()
+                    }
+                } else {
+                    onGameControlMessage?.invoke("PLAYER_LEFT")
+                    onPlayerDisconnected?.invoke()
+                }
                 Log.d(TAG, "Disconnected from host")
             }
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                gatt.discoverServices()
-            }
+            Log.d(TAG, "MTU changed to $mtu, status=$status")
+            // Always discover services even if status != GATT_SUCCESS
+            gatt.discoverServices()
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
@@ -463,8 +717,13 @@ class CaroBleService : Service() {
                 enqueueGattOp {
                     gatt.setCharacteristicNotification(notifyChar, true)
                     val descriptor = notifyChar.getDescriptor(BleConstants.CCCD_UUID)
-                    descriptor?.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    gatt.writeDescriptor(descriptor)
+                    if (descriptor != null) {
+                        descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        val ok = gatt.writeDescriptor(descriptor)
+                        if (!ok) onGattOpComplete()
+                    } else {
+                        onGattOpComplete()
+                    }
                 }
             }
 
@@ -477,17 +736,62 @@ class CaroBleService : Service() {
                 enqueueGattOp {
                     gatt.setCharacteristicNotification(controlChar, true)
                     val descriptor = controlChar.getDescriptor(BleConstants.CCCD_UUID)
-                    descriptor?.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    gatt.writeDescriptor(descriptor)
+                    if (descriptor != null) {
+                        descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        val ok = gatt.writeDescriptor(descriptor)
+                        if (!ok) onGattOpComplete()
+                    } else {
+                        onGattOpComplete()
+                    }
                 }
             }
 
             // Step 3: Request full board sync (queued, runs after step 2 completes)
             enqueueGattOp {
-                requestFullSync(gatt)
+                val readChar = gatt
+                    .getService(BleConstants.CARO_SERVICE_UUID)
+                    ?.getCharacteristic(BleConstants.FULL_SYNC_READ_CHAR_UUID)
+                if (readChar != null) {
+                    val ok = gatt.readCharacteristic(readChar)
+                    if (!ok) onGattOpComplete()
+                } else {
+                    onGattOpComplete()
+                }
             }
 
-            onPlayerConnected?.invoke("joined")
+            // Step 4: After all subscriptions + sync complete, notify host we're ready
+            // Inline the write to avoid nested queuing (sendControlToHost now self-enqueues)
+            enqueueGattOp {
+                val servDevice = gatt.device
+                onPlayerConnected?.invoke("joined", servDevice.address, servDevice.name ?: servDevice.address)
+                val innerGatt = clientGatt
+                val controlChar = innerGatt
+                    ?.getService(BleConstants.CARO_SERVICE_UUID)
+                    ?.getCharacteristic(BleConstants.GAME_CONTROL_CHAR_UUID)
+                val subsBytes = BleConstants.MSG_SUBS_COMPLETE.toByteArray(Charsets.UTF_8)
+                if (innerGatt != null && controlChar != null) {
+                    val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        innerGatt.writeCharacteristic(
+                            controlChar, subsBytes,
+                            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                        ) == BluetoothStatusCodes.SUCCESS
+                    } else {
+                        @Suppress("DEPRECATION")
+                        controlChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                        @Suppress("DEPRECATION")
+                        controlChar.value = subsBytes
+                        @Suppress("DEPRECATION")
+                        innerGatt.writeCharacteristic(controlChar) == true
+                    }
+                    if (!ok) {
+                        Log.e(TAG, "writeCharacteristic failed for SUBS_COMPLETE")
+                        onGattOpComplete()
+                    }
+                    // else: onCharacteristicWrite callback will call onGattOpComplete()
+                } else {
+                    onGattOpComplete()
+                }
+            }
         }
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
@@ -499,38 +803,57 @@ class CaroBleService : Service() {
             onGattOpComplete()
         }
 
-        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+        override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d(TAG, "Characteristic write success for ${characteristic.uuid}")
+            } else {
+                Log.e(TAG, "Characteristic write failed for ${characteristic.uuid}, status=$status")
+            }
+            onGattOpComplete()
+        }
+
+        // API 33+ callback — value is passed directly (avoids deprecated characteristic.value)
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
             when (characteristic.uuid) {
                 BleConstants.MOVE_NOTIFY_CHAR_UUID -> {
-                    // Received a new move from host
                     try {
-                        val json = String(characteristic.value, Charsets.UTF_8)
+                        val json = String(value, Charsets.UTF_8)
                         val move = Json.decodeFromString<CaroMove>(json)
-                        scope.launch {
-                            repository?.applyRemoteMove(move, gameId)
-                        }
+                        scope.launch { repository?.applyRemoteMove(move, gameId) }
                         onMoveReceived?.invoke(move)
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to parse incoming move", e)
                     }
                 }
                 BleConstants.GAME_CONTROL_CHAR_UUID -> {
-                    val message = String(characteristic.value, Charsets.UTF_8)
+                    val message = String(value, Charsets.UTF_8)
+                    if (message == BleConstants.MSG_HEARTBEAT) resetWatchdog()
                     onGameControlMessage?.invoke(message)
                 }
             }
         }
 
+        // Keep legacy override so devices running API < 33 still fire the callback
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            onCharacteristicChanged(gatt, characteristic, characteristic.value ?: return)
+        }
+
         override fun onCharacteristicRead(
-            gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int
         ) {
             if (characteristic.uuid == BleConstants.FULL_SYNC_READ_CHAR_UUID && status == BluetoothGatt.GATT_SUCCESS) {
                 try {
-                    val json = String(characteristic.value, Charsets.UTF_8)
+                    val json = String(value, Charsets.UTF_8)
                     val moves = Json.decodeFromString<List<CaroMove>>(json)
-                    scope.launch {
-                        repository?.fullSync(moves)
-                    }
+                    scope.launch { repository?.fullSync(moves) }
                     Log.d(TAG, "Full sync received: ${moves.size} moves")
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to parse full sync data", e)
@@ -538,14 +861,11 @@ class CaroBleService : Service() {
             }
             onGattOpComplete()
         }
-    }
 
-    private fun requestFullSync(gatt: BluetoothGatt) {
-        val readChar = gatt
-            .getService(BleConstants.CARO_SERVICE_UUID)
-            ?.getCharacteristic(BleConstants.FULL_SYNC_READ_CHAR_UUID)
-        if (readChar != null) {
-            gatt.readCharacteristic(readChar)
+        // Keep legacy override so devices running API < 33 still fire the callback
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+            onCharacteristicRead(gatt, characteristic, characteristic.value ?: ByteArray(0), status)
         }
     }
 
@@ -554,6 +874,11 @@ class CaroBleService : Service() {
     // ══════════════════════════════════════════════════════════════════════
 
     fun cleanup() {
+        isGamePlaying = false
+        stopHeartbeat()
+        stopWatchdog()
+        reconnectJob?.cancel()
+        reconnectJob = null
         stopHosting()
         disconnectFromHost()
         scope.cancel()

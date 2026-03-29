@@ -9,7 +9,7 @@ import {colors} from '../theme';
 
 export type RootStackParamList = {
   Home: undefined;
-  Lobby: {role: 'host' | 'join'};
+  Lobby: { role: 'host' | 'join'; passKey?: string };
   Game: undefined;
   HowToPlay: undefined;
 };

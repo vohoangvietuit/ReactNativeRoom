@@ -1,5 +1,5 @@
 import React from 'react';
-import {View, Text, StyleSheet} from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
 import {Badge} from '../ui/Badge';
 import {colors, spacing, fontSize} from '../../theme';
 
@@ -10,6 +10,7 @@ interface GameHUDProps {
   moveCount: number;
   connectedPlayers: number;
   status: string;
+  onForfeit?: () => void;
 }
 
 export const GameHUD: React.FC<GameHUDProps> = ({
@@ -19,6 +20,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
   moveCount,
   connectedPlayers,
   status,
+  onForfeit,
 }) => {
   const isMyTurn = currentTurn === mySymbol;
   const turnLabel = isMyTurn ? 'Your Turn' : `${currentTurn}'s Turn`;
@@ -32,7 +34,8 @@ export const GameHUD: React.FC<GameHUDProps> = ({
             style={[
               styles.symbolText,
               mySymbol === 'X' ? styles.symbolX : styles.symbolO,
-            ]}>
+            ]}
+          >
             {mySymbol || '?'}
           </Text>
           <View>
@@ -62,9 +65,22 @@ export const GameHUD: React.FC<GameHUDProps> = ({
         </View>
 
         <View style={styles.statsCol}>
-          <View style={[styles.connectionDot, connectedPlayers > 0 ? styles.dotOnline : styles.dotOffline]} />
-          <Text style={styles.statLabel}>{connectedPlayers > 0 ? 'Online' : 'Offline'}</Text>
+          <View
+            style={[
+              styles.connectionDot,
+              connectedPlayers > 0 ? styles.dotOnline : styles.dotOffline,
+            ]}
+          />
+          <Text style={styles.statLabel}>
+            {connectedPlayers > 0 ? 'Online' : 'Offline'}
+          </Text>
         </View>
+
+        {onForfeit && status === 'PLAYING' && (
+          <TouchableOpacity style={styles.forfeitBtn} onPress={onForfeit}>
+            <Text style={styles.forfeitText}>✕ Forfeit</Text>
+          </TouchableOpacity>
+        )}
       </View>
     </View>
   );
@@ -149,5 +165,17 @@ const styles = StyleSheet.create({
   },
   dotOffline: {
     backgroundColor: colors.error,
+  },
+  forfeitBtn: {
+    paddingHorizontal: spacing.sm,
+    paddingVertical: spacing.xs,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: 'rgba(239,68,68,0.4)',
+  },
+  forfeitText: {
+    fontSize: fontSize.xs,
+    color: '#ef4444',
+    fontWeight: '600',
   },
 });

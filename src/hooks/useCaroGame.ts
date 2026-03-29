@@ -26,6 +26,11 @@ export function useCaroGame() {
   const [lastMoveResult, setLastMoveResult] = useState<MoveResultData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [opponentLeft, setOpponentLeft] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [authFailed, setAuthFailed] = useState(false);
+  const [gameCancelled, setGameCancelled] = useState(false);
 
   // Derive 2D board from moves list
   const board = useMemo(() => {
@@ -115,6 +120,56 @@ export function useCaroGame() {
       setGameState(prev => ({...prev, status: 'FINISHED'}));
     });
 
+    const playerLeftSub = eventEmitter.addListener('onPlayerLeft', () => {
+      setOpponentLeft(true);
+      setGameState(prev => ({
+        ...prev,
+        status: 'FINISHED',
+        connectedPlayers: 0,
+      }));
+    });
+
+    const gameCancelSub = eventEmitter.addListener('onGameCancel', () => {
+      setGameCancelled(true);
+      setGameState(prev => ({
+        ...prev,
+        status: 'FINISHED',
+        connectedPlayers: 0,
+      }));
+    });
+
+    const reconnectingSub = eventEmitter.addListener('onReconnecting', () => {
+      setIsReconnecting(true);
+    });
+
+    const reconnectedSub = eventEmitter.addListener('onReconnected', () => {
+      setIsReconnecting(false);
+    });
+
+    const authRequiredSub = eventEmitter.addListener(
+      'onAuthRequired',
+      (_gameId: string) => {
+        setAuthRequired(true);
+        setAuthFailed(false);
+      },
+    );
+
+    const authFailSub = eventEmitter.addListener('onAuthFail', () => {
+      setAuthFailed(true);
+    });
+
+    const authSuccessSub = eventEmitter.addListener('onAuthSuccess', () => {
+      setAuthRequired(false);
+      setAuthFailed(false);
+    });
+
+    const playerReadySub = eventEmitter.addListener(
+      'onPlayerReady',
+      (_data: string) => {
+        setGameState(prev => ({ ...prev, challengerReady: true }));
+      },
+    );
+
     // Register listener with native side
     CaroGame?.addListener('onBoardUpdate');
 
@@ -124,6 +179,14 @@ export function useCaroGame() {
       playerConnSub.remove();
       playerDiscSub.remove();
       gameOverSub.remove();
+      playerLeftSub.remove();
+      gameCancelSub.remove();
+      reconnectingSub.remove();
+      reconnectedSub.remove();
+      authRequiredSub.remove();
+      authFailSub.remove();
+      authSuccessSub.remove();
+      playerReadySub.remove();
     };
   }, []);
 
@@ -214,7 +277,7 @@ export function useCaroGame() {
     [refreshBoard],
   );
 
-  const startHosting = useCallback(async (playerName: string) => {
+  const startHosting = useCallback(async (playerName: string, passKey = '') => {
     if (!CaroGame) {
       const msg = 'Game module not available';
       setError(msg);
@@ -223,7 +286,7 @@ export function useCaroGame() {
     setLoading(true);
     setError(null);
     try {
-      const gameId = await CaroGame.startHosting(playerName);
+      const gameId = await CaroGame.startHosting(playerName, passKey);
       setGameState(prev => ({
         ...prev,
         gameId,
@@ -286,6 +349,53 @@ export function useCaroGame() {
       connectedPlayers: 0,
     });
     setLastMoveResult(null);
+    setOpponentLeft(false);
+    setGameCancelled(false);
+    setIsReconnecting(false);
+    setAuthRequired(false);
+    setAuthFailed(false);
+  }, []);
+
+  const setReady = useCallback(async () => {
+    try {
+      await CaroGame?.setReady();
+    } catch {}
+  }, []);
+
+  const cancelGame = useCallback(async () => {
+    try {
+      await CaroGame?.cancelGame();
+      setMoves([]);
+      setGameState({
+        gameId: '',
+        status: 'WAITING',
+        myRole: '',
+        mySymbol: '',
+        currentTurn: 'X',
+        connectedPlayers: 0,
+      });
+      setLastMoveResult(null);
+      setOpponentLeft(false);
+      setIsReconnecting(false);
+    } catch {}
+  }, []);
+
+  const submitPassKey = useCallback(async (key: string) => {
+    try {
+      await CaroGame?.submitPassKey(key);
+    } catch {}
+  }, []);
+
+  const initialize = useCallback(async () => {
+    try {
+      await CaroGame?.initialize();
+    } catch {}
+  }, []);
+
+  const reconnect = useCallback(async () => {
+    try {
+      await CaroGame?.reconnect();
+    } catch {}
   }, []);
 
   return {
@@ -300,6 +410,11 @@ export function useCaroGame() {
     isConnected,
     loading,
     error,
+    opponentLeft,
+    isReconnecting,
+    authRequired,
+    authFailed,
+    gameCancelled,
 
     // Actions
     placeMove,
@@ -307,6 +422,11 @@ export function useCaroGame() {
     joinGame,
     startMatch,
     stopGame,
+    setReady,
+    cancelGame,
+    submitPassKey,
+    initialize,
+    reconnect,
     refreshBoard,
     refreshGameState,
   };

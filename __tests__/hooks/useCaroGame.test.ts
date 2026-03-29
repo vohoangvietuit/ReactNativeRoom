@@ -96,7 +96,7 @@ describe('useCaroGame', () => {
       const {result} = renderHook(() => useCaroGame());
 
       // Catch inside act so React properly flushes state updates
-      let thrownError: Error | null = null;
+      let thrownError: Error | undefined;
       await act(async () => {
         try {
           await result.current.startHosting('Player1');
@@ -356,7 +356,7 @@ describe('useCaroGame', () => {
 
       // Wait for the effect that syncs board on mount
       await act(async () => {
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise<void>(resolve => setTimeout(resolve, 100));
       });
 
       expect(result.current.board[7][7]).toBe('X');

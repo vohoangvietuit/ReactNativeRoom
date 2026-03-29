@@ -1,4 +1,4 @@
-import React, {useEffect, useRef} from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -6,21 +6,26 @@ import {
   StatusBar,
   Animated,
   Dimensions,
+  Modal,
+  TextInput,
+  TouchableOpacity,
 } from 'react-native';
-import {useSafeAreaInsets} from 'react-native-safe-area-context';
-import {Button} from '../components/ui/Button';
-import {colors, spacing, fontSize, borderRadius} from '../theme';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { Button } from '../components/ui/Button';
+import { colors, spacing, fontSize, borderRadius } from '../theme';
 
-const {width: SCREEN_WIDTH} = Dimensions.get('window');
+const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
 interface HomeScreenProps {
   navigation: any;
 }
 
-export const HomeScreen: React.FC<HomeScreenProps> = ({navigation}) => {
+export const HomeScreen: React.FC<HomeScreenProps> = ({ navigation }) => {
   const insets = useSafeAreaInsets();
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const slideAnim = useRef(new Animated.Value(30)).current;
+  const [showPasskeyModal, setShowPasskeyModal] = useState(false);
+  const [passKey, setPassKey] = useState('');
 
   useEffect(() => {
     Animated.parallel([
@@ -38,17 +43,22 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({navigation}) => {
   }, [fadeAnim, slideAnim]);
 
   return (
-    <View style={[styles.container, {paddingTop: insets.top}]}>
+    <View style={[styles.container, { paddingTop: insets.top }]}>
       <StatusBar barStyle="light-content" backgroundColor={colors.background} />
 
       {/* Decorative grid background */}
       <View style={styles.gridDecoration}>
-        {Array.from({length: 6}).map((_r, row) => (
+        {Array.from({ length: 6 }).map((_r, row) => (
           <View key={row} style={styles.gridRow}>
-            {Array.from({length: 6}).map((_c, col) => (
+            {Array.from({ length: 6 }).map((_c, col) => (
               <View key={col} style={styles.gridCell}>
-                {((row + col) % 3 === 0) && (
-                  <Text style={[styles.gridSymbol, col % 2 === 0 ? styles.gridX : styles.gridO]}>
+                {(row + col) % 3 === 0 && (
+                  <Text
+                    style={[
+                      styles.gridSymbol,
+                      col % 2 === 0 ? styles.gridX : styles.gridO,
+                    ]}
+                  >
                     {col % 2 === 0 ? '×' : '○'}
                   </Text>
                 )}
@@ -62,8 +72,9 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({navigation}) => {
       <Animated.View
         style={[
           styles.content,
-          {opacity: fadeAnim, transform: [{translateY: slideAnim}]},
-        ]}>
+          { opacity: fadeAnim, transform: [{ translateY: slideAnim }] },
+        ]}
+      >
         {/* Logo area */}
         <View style={styles.logoArea}>
           <View style={styles.logoGrid}>
@@ -84,16 +95,14 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({navigation}) => {
             </View>
           </View>
           <Text style={styles.title}>CARO</Text>
-          <Text style={styles.subtitle}>
-            Bluetooth Multiplayer Gomoku
-          </Text>
+          <Text style={styles.subtitle}>Bluetooth Multiplayer Gomoku</Text>
         </View>
 
         {/* Menu */}
         <View style={styles.menu}>
           <Button
             title="Host Game"
-            onPress={() => navigation.navigate('Lobby', {role: 'host'})}
+            onPress={() => setShowPasskeyModal(true)}
             variant="primary"
             size="lg"
             icon={<Text style={styles.menuIcon}>📡</Text>}
@@ -102,7 +111,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({navigation}) => {
 
           <Button
             title="Join Game"
-            onPress={() => navigation.navigate('Lobby', {role: 'join'})}
+            onPress={() => navigation.navigate('Lobby', { role: 'join' })}
             variant="secondary"
             size="lg"
             icon={<Text style={styles.menuIcon}>🔍</Text>}
@@ -121,12 +130,59 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({navigation}) => {
 
         {/* Footer */}
         <View style={styles.footer}>
-          <Text style={styles.footerText}>
-            Room + BLE + TurboModule Demo
-          </Text>
+          <Text style={styles.footerText}>Room + BLE + TurboModule Demo</Text>
           <Text style={styles.version}>v1.0.0</Text>
         </View>
       </Animated.View>
+
+      {/* Passkey modal for hosting */}
+      <Modal
+        visible={showPasskeyModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowPasskeyModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Host Game</Text>
+            <Text style={styles.modalSubtitle}>
+              Optional: set a passkey so only invited players can join.
+            </Text>
+            <TextInput
+              style={styles.passkeyInput}
+              placeholder="Passkey (leave blank for open)"
+              placeholderTextColor={colors.textMuted}
+              value={passKey}
+              onChangeText={setPassKey}
+              secureTextEntry
+              autoCapitalize="none"
+            />
+            <View style={styles.modalButtons}>
+              <TouchableOpacity
+                style={[styles.modalBtn, styles.modalBtnCancel]}
+                onPress={() => {
+                  setShowPasskeyModal(false);
+                  setPassKey('');
+                }}
+              >
+                <Text style={styles.modalBtnText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.modalBtn, styles.modalBtnConfirm]}
+                onPress={() => {
+                  setShowPasskeyModal(false);
+                  navigation.navigate('Lobby', { role: 'host', passKey });
+                  setPassKey('');
+                }}
+              >
+                <Text style={[styles.modalBtnText, styles.modalBtnConfirmText]}>
+                  Host
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 };
@@ -237,5 +293,64 @@ const styles = StyleSheet.create({
     color: colors.textMuted,
     marginTop: spacing.xs,
     opacity: 0.5,
+  },
+  // Passkey modal
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: spacing.xl,
+  },
+  modalCard: {
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.lg,
+    padding: spacing.xl,
+    width: '100%',
+  },
+  modalTitle: {
+    fontSize: fontSize.xl,
+    fontWeight: '800',
+    color: colors.textPrimary,
+    marginBottom: spacing.xs,
+  },
+  modalSubtitle: {
+    fontSize: fontSize.sm,
+    color: colors.textSecondary,
+    marginBottom: spacing.lg,
+  },
+  passkeyInput: {
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: borderRadius.md,
+    padding: spacing.md,
+    color: colors.textPrimary,
+    fontSize: fontSize.md,
+    marginBottom: spacing.lg,
+  },
+  modalButtons: {
+    flexDirection: 'row',
+    gap: spacing.md,
+  },
+  modalBtn: {
+    flex: 1,
+    paddingVertical: spacing.sm,
+    borderRadius: borderRadius.md,
+    alignItems: 'center',
+  },
+  modalBtnCancel: {
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  modalBtnConfirm: {
+    backgroundColor: colors.primary,
+  },
+  modalBtnText: {
+    fontSize: fontSize.md,
+    fontWeight: '600',
+    color: colors.textSecondary,
+  },
+  modalBtnConfirmText: {
+    color: colors.background,
   },
 });

@@ -24,6 +24,10 @@ const mockCaroGame = {
   ),
   addListener: jest.fn(),
   removeListeners: jest.fn(),
+  setReady: jest.fn().mockResolvedValue(null),
+  cancelGame: jest.fn().mockResolvedValue(null),
+  submitPassKey: jest.fn().mockResolvedValue(null),
+  initialize: jest.fn().mockResolvedValue(null),
 };
 
 export default mockCaroGame;

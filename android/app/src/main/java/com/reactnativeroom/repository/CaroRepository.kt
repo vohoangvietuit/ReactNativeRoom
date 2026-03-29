@@ -3,6 +3,8 @@ package com.reactnativeroom.repository
 import com.reactnativeroom.database.CaroDao
 import com.reactnativeroom.database.CaroMove
 import com.reactnativeroom.database.GameSession
+import com.reactnativeroom.database.PendingMove
+import com.reactnativeroom.database.PendingMoveDao
 import com.reactnativeroom.game.WinChecker
 import com.reactnativeroom.game.WinResult
 import kotlinx.coroutines.flow.Flow
@@ -14,7 +16,10 @@ data class MoveResult(
     val isDraw: Boolean = false
 )
 
-class CaroRepository(private val dao: CaroDao) {
+class CaroRepository(
+    private val dao: CaroDao,
+    private val pendingDao: PendingMoveDao
+) {
 
     // Live board updates for UI
     val observeMoves: Flow<List<CaroMove>> = dao.observeMoves()
@@ -109,11 +114,50 @@ class CaroRepository(private val dao: CaroDao) {
     }
 
     /**
-     * Full sync — replace local board with host's moves (for late-joining spectators)
+     * Optimistically queue a challenger move while offline (or as backup when online).
+     * Writes to caro_moves with IGNORE conflict (avoids duplicates), and records
+     * the move in pending_moves for deferred BLE delivery on reconnect.
+     * Returns the PendingMove id for later markMoveSynced() calls.
      */
-    suspend fun fullSync(moves: List<CaroMove>) {
+    suspend fun queueMove(move: CaroMove, gameId: String): Int {
+        dao.insertMoveIgnore(move)
+        val pending = PendingMove(
+            x = move.x,
+            y = move.y,
+            playerSymbol = move.playerSymbol,
+            gameId = gameId
+        )
+        pendingDao.insert(pending)
+        return pendingDao.getUnsynced().lastOrNull { it.x == move.x && it.y == move.y }?.id ?: 0
+    }
+
+    suspend fun getPendingMoves(): List<PendingMove> = pendingDao.getUnsynced()
+
+    suspend fun markMoveSynced(id: Int) = pendingDao.markSynced(id)
+
+    /**
+     * Full sync — replace local board with host's confirmed moves.
+     * Pending (unsynced) moves whose cell already appears in the confirmed set are marked synced.
+     * Pending moves that are NOT yet confirmed are re-inserted so the board stays optimistic.
+     */
+    suspend fun fullSync(confirmedMoves: List<CaroMove>) {
+        val confirmedPositions = confirmedMoves.map { it.x to it.y }.toSet()
+        val pending = pendingDao.getUnsynced()
+
         dao.clearMoves()
-        dao.insertAll(moves)
+        dao.insertAll(confirmedMoves)
+
+        // Re-apply pending moves that haven't been confirmed yet (keeps optimistic UI stable)
+        for (pm in pending) {
+            if (confirmedPositions.contains(pm.x to pm.y)) {
+                pendingDao.markSyncedByPosition(pm.x, pm.y, pm.gameId)
+            } else {
+                dao.insertMoveIgnore(
+                    CaroMove(x = pm.x, y = pm.y, playerSymbol = pm.playerSymbol,
+                        moveNumber = confirmedMoves.size + 1, timestamp = pm.timestamp)
+                )
+            }
+        }
     }
 
     suspend fun getBoard(): List<CaroMove> = dao.getAllMoves()
@@ -140,5 +184,6 @@ class CaroRepository(private val dao: CaroDao) {
     suspend fun clearAll() {
         dao.clearMoves()
         dao.clearSessions()
+        pendingDao.clearAll()
     }
 }

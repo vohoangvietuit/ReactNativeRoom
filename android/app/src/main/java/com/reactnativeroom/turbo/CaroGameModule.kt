@@ -19,11 +19,13 @@ import com.reactnativeroom.database.CaroDatabase
 import com.reactnativeroom.database.CaroMove
 import com.reactnativeroom.repository.CaroRepository
 import com.reactnativeroom.service.CaroBleService
+import com.reactnativeroom.service.BleConstants
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import java.security.MessageDigest
 import java.util.UUID
 
 @Serializable
@@ -44,7 +46,11 @@ data class GameStateResponse(
     val mySymbol: String,
     val currentTurn: String,
     val connectedPlayers: Int,
-    val winner: String? = null
+    val winner: String? = null,
+    val hostDeviceId: String = "",
+    val challengerDeviceId: String = "",
+    val challengerDeviceName: String = "",
+    val challengerReady: Boolean = false
 )
 
 @ReactModule(name = CaroGameModule.NAME)
@@ -61,16 +67,26 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
 
     private val db by lazy { CaroDatabase.getInstance(reactApplicationContext) }
     private val dao by lazy { db.caroDao() }
-    private val repo by lazy { CaroRepository(dao) }
+    private val pendingDao by lazy { db.pendingMoveDao() }
+    private val repo by lazy { CaroRepository(dao, pendingDao) }
 
     private var bleService: CaroBleService? = null
     private var isBound = false
+    private var serviceConnection: ServiceConnection? = null
 
     private var gameId = ""
     private var myRole = ""      // "host" | "challenger"
     private var mySymbol = ""    // "X" | "O" | ""
     private var connectedPlayers = 0
     private var boardObserverJob: Job? = null
+
+    // Identity & lobby state
+    private var passKeyHash = ""           // sha256(passKey).take(8) or "" for open games
+    private var challengerDeviceId = ""
+    private var challengerDeviceName = ""
+    private var challengerReady = false
+    private var hostDeviceId = ""          // set by challenger when it connects
+    private var isReconnecting = false
 
     private val deviceId: String
         get() = Settings.Secure.getString(
@@ -97,18 +113,35 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
                             moveNumber = repo.getMoveCount()
                         )
                         bleService?.broadcastMove(move)
+
+                        // Broadcast game-over control message so challenger shows modal
+                        if (result.winResult?.isWin == true) {
+                            bleService?.broadcastControl("GAME_OVER:${result.winResult.winner}")
+                        } else if (result.isDraw) {
+                            bleService?.broadcastControl("GAME_OVER:DRAW")
+                        }
                     }
                     promise.resolve(serializeMoveResult(result))
                 } else if (myRole == "challenger") {
-                    // Challenger sends move to host via BLE
+                    // Challenger queues move locally (optimistic UI) and sends via BLE if connected.
+                    // If disconnected, the move is saved in pending_moves and flushed on reconnect.
                     val moveCount = repo.getMoveCount()
                     val move = CaroMove(
                         x = ix, y = iy,
                         playerSymbol = mySymbol,
                         moveNumber = moveCount + 1
                     )
-                    bleService?.sendMoveToHost(move)
-                    // Return pending — board will update via onBoardUpdate event
+                    // Optimistic write to local DB (updates board immediately via Room observer)
+                    val pendingId = repo.queueMove(move, gameId)
+
+                    if (bleService?.isConnectedToHost() == true) {
+                        // Connected — best-effort immediate send; mark synced on success
+                        bleService?.sendMoveToHost(move)
+                        // Mark synced optimistically; host will confirm via broadcastMove event
+                        if (pendingId > 0) repo.markMoveSynced(pendingId)
+                    }
+                    // Board will update via onBoardUpdate event when host confirms.
+                    // If host rejects (occupied cell, wrong turn), fullSync on reconnect will reconcile.
                     promise.resolve(Json.encodeToString(PlaceMoveResponse(
                         success = true,
                         isWin = false,
@@ -153,7 +186,11 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
                     mySymbol = mySymbol,
                     currentTurn = currentTurn,
                     connectedPlayers = connectedPlayers,
-                    winner = session?.winner
+                    winner = session?.winner,
+                    hostDeviceId = if (myRole == "host") deviceId else hostDeviceId,
+                    challengerDeviceId = challengerDeviceId,
+                    challengerDeviceName = challengerDeviceName,
+                    challengerReady = challengerReady
                 )
                 promise.resolve(Json.encodeToString(state))
             } catch (e: Exception) {
@@ -186,7 +223,7 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
-    fun startHosting(playerName: String, promise: Promise) {
+    fun startHosting(playerName: String, passKey: String, promise: Promise) {
         moduleScope.launch {
             try {
                 if (!hasBlePermissions()) {
@@ -210,6 +247,7 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
                 gameId = UUID.randomUUID().toString().take(8)
                 myRole = "host"
                 mySymbol = "X"
+                passKeyHash = if (passKey.isNotBlank()) sha256(passKey).take(8) else ""
 
                 // Create game session
                 repo.clearAll()
@@ -285,6 +323,8 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
         moduleScope.launch {
             try {
                 repo.startGame(gameId)
+                bleService?.isGamePlaying = true
+                bleService?.startHeartbeat()
                 bleService?.broadcastControl("GAME_START")
                 sendEvent("onGameStateChange", Json.encodeToString(mapOf(
                     "status" to "PLAYING",
@@ -299,6 +339,7 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun stopGame() {
+        bleService?.isGamePlaying = false
         bleService?.cleanup()
         moduleScope.launch {
             repo.clearAll()
@@ -307,7 +348,95 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
         mySymbol = ""
         gameId = ""
         connectedPlayers = 0
+        passKeyHash = ""
+        challengerDeviceId = ""
+        challengerDeviceName = ""
+        challengerReady = false
+        hostDeviceId = ""
+        isReconnecting = false
         unbindBleService()
+    }
+
+    /** Sends PLAYER_READY:{deviceId}:{deviceName} to the host. Challenger only. */
+    @ReactMethod
+    fun setReady(promise: Promise) {
+        if (myRole != "challenger") {
+            promise.reject("NOT_CHALLENGER", "Only challenger can call setReady")
+            return
+        }
+        val name = bluetoothAdapter()?.name ?: deviceId
+        bleService?.sendControlToHost("${BleConstants.MSG_PLAYER_READY}:${deviceId}:${name}")
+        promise.resolve(null)
+    }
+
+    /** Sends AUTH:{hash8} to the host. Challenger only. */
+    @ReactMethod
+    fun submitPassKey(key: String, promise: Promise) {
+        if (myRole != "challenger") {
+            promise.reject("NOT_CHALLENGER", "Only challenger can submit passkey")
+            return
+        }
+        val hash = sha256(key).take(8)
+        bleService?.sendControlToHost("${BleConstants.MSG_AUTH}:${hash}")
+        promise.resolve(null)
+    }
+
+    /** Cancels the ongoing game for both players. Works for host and challenger. */
+    @ReactMethod
+    fun cancelGame(promise: Promise) {
+        moduleScope.launch {
+            try {
+                bleService?.isGamePlaying = false
+                bleService?.stopHeartbeat()
+                when (myRole) {
+                    "host" -> bleService?.broadcastControl(BleConstants.MSG_GAME_CANCEL)
+                    "challenger" -> bleService?.sendControlToHost(BleConstants.MSG_GAME_CANCEL)
+                }
+                repo.clearAll()
+                myRole = ""
+                mySymbol = ""
+                gameId = ""
+                connectedPlayers = 0
+                passKeyHash = ""
+                challengerDeviceId = ""
+                challengerDeviceName = ""
+                challengerReady = false
+                hostDeviceId = ""
+                isReconnecting = false
+                unbindBleService()
+                sendEvent("onGameCancel", "")
+                promise.resolve(null)
+            } catch (e: Exception) {
+                promise.reject("CANCEL_ERROR", e.message, e)
+            }
+        }
+    }
+
+    /** Wipes stale DB state on app cold-start. Safe to call repeatedly. */
+    @ReactMethod
+    fun initialize(promise: Promise) {
+        moduleScope.launch {
+            try {
+                if (myRole.isEmpty()) {
+                    // No active in-memory game session — clear any leftover DB state
+                    repo.clearAll()
+                }
+                promise.resolve(null)
+            } catch (e: Exception) {
+                promise.reject("INIT_ERROR", e.message, e)
+            }
+        }
+    }
+
+    /**
+     * Manually reconnect to the last known BLE host.
+     * Used when the user taps the "Reconnect" button in the game UI.
+     * No-op if already connected or no host was previously seen.
+     */
+    @ReactMethod
+    fun reconnect(promise: Promise) {
+        bleService?.reconnect()
+        promise.resolve(null)
     }
 
     // ── BLE Service Binding ──────────────────────────────────────────────
@@ -321,7 +450,7 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
             return
         }
 
-        reactApplicationContext.bindService(intent, object : ServiceConnection {
+        val conn = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName, binder: IBinder) {
                 try {
                     bleService = (binder as CaroBleService.LocalBinder).getService()
@@ -335,27 +464,75 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
             override fun onServiceDisconnected(name: ComponentName) {
                 bleService = null
                 isBound = false
+                serviceConnection = null
             }
-        }, Context.BIND_AUTO_CREATE)
+        }
+        serviceConnection = conn
+        reactApplicationContext.bindService(intent, conn, Context.BIND_AUTO_CREATE)
     }
 
     private fun unbindBleService() {
-        if (isBound) {
+        val conn = serviceConnection
+        if (isBound && conn != null) {
             try {
-                val intent = Intent(reactApplicationContext, CaroBleService::class.java)
-                reactApplicationContext.stopService(intent)
+                reactApplicationContext.unbindService(conn)
             } catch (_: Exception) { }
             isBound = false
+            serviceConnection = null
         }
+        try {
+            val intent = Intent(reactApplicationContext, CaroBleService::class.java)
+            reactApplicationContext.stopService(intent)
+        } catch (_: Exception) { }
     }
 
     private fun setupBleCallbacks() {
         // onMoveReceived only used by challenger — host gets board updates via Room observer
         bleService?.onMoveReceived = { _ -> }
 
-        bleService?.onPlayerConnected = { role ->
+        bleService?.onPlayerConnected = { role, devId, devName ->
             connectedPlayers++
-            sendEvent("onPlayerConnected", role)
+            when (role) {
+                "challenger" -> {
+                    // Host side: record who joined
+                    challengerDeviceId = devId
+                    challengerDeviceName = devName
+                    // AUTH_CHALLENGE is deferred until SUBS_COMPLETE arrives
+                    // (challenger must finish subscribing before it can receive notifications)
+                    sendEvent("onPlayerConnected", Json.encodeToString(mapOf(
+                        "role" to role,
+                        "deviceId" to devId,
+                        "deviceName" to devName
+                    )))
+                    // Emit updated game state so Lobby sees the challenger info
+                    sendEvent("onGameStateChange", Json.encodeToString(mapOf(
+                        "challengerDeviceId" to devId,
+                        "challengerDeviceName" to devName,
+                        "challengerReady" to false,
+                        "connectedPlayers" to connectedPlayers
+                    )))
+                }
+                "joined" -> {
+                    // Challenger side: record host identity
+                    hostDeviceId = devId
+                    sendEvent("onPlayerConnected", Json.encodeToString(mapOf(
+                        "role" to role,
+                        "deviceId" to devId,
+                        "deviceName" to devName
+                    )))
+                    sendEvent("onGameStateChange", Json.encodeToString(mapOf(
+                        "hostDeviceId" to devId,
+                        "connectedPlayers" to connectedPlayers
+                    )))
+                }
+                else -> {
+                    sendEvent("onPlayerConnected", Json.encodeToString(mapOf(
+                        "role" to role,
+                        "deviceId" to devId,
+                        "deviceName" to devName
+                    )))
+                }
+            }
         }
 
         bleService?.onPlayerDisconnected = {
@@ -364,22 +541,159 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
         }
 
         bleService?.onGameControlMessage = { message ->
-            when (message) {
-                "GAME_START" -> {
-                    sendEvent("onGameStateChange", Json.encodeToString(mapOf(
-                        "status" to "PLAYING"
-                    )))
+            when {
+                message == BleConstants.MSG_GAME_START -> {
+                    bleService?.isGamePlaying = true
+                    bleService?.resetWatchdog()
+                    // Create challenger's DB session BEFORE sending event so GameScreen mount-sync reads PLAYING
+                    moduleScope.launch {
+                        repo.createSession(gameId, hostDeviceId)
+                        repo.startGame(gameId)
+                        sendEvent("onGameStateChange", Json.encodeToString(mapOf(
+                            "status" to "PLAYING"
+                        )))
+                    }
                 }
-                "GAME_RESET" -> {
+                message == BleConstants.MSG_GAME_RESET -> {
                     moduleScope.launch { repo.clearAll() }
                     sendEvent("onGameStateChange", Json.encodeToString(mapOf(
                         "status" to "WAITING"
                     )))
                 }
-                else -> {
-                    if (message.startsWith("GAME_OVER")) {
-                        sendEvent("onGameOver", message)
+                message == BleConstants.MSG_PLAYER_LEFT -> {
+                    isReconnecting = false
+                    bleService?.isGamePlaying = false
+                    bleService?.stopWatchdog()
+                    moduleScope.launch { repo.clearAll() }
+                    sendEvent("onPlayerLeft", "")
+                    sendEvent("onGameStateChange", Json.encodeToString(mapOf(
+                        "status" to "FINISHED"
+                    )))
+                }
+                message == BleConstants.MSG_GAME_CANCEL -> {
+                    bleService?.isGamePlaying = false
+                    bleService?.stopHeartbeat()
+                    bleService?.stopWatchdog()
+                    moduleScope.launch { repo.clearAll() }
+                    myRole = ""
+                    mySymbol = ""
+                    gameId = ""
+                    connectedPlayers = 0
+                    isReconnecting = false
+                    sendEvent("onGameCancel", "")
+                }
+                message == BleConstants.MSG_SUBS_COMPLETE -> {
+                    // Challenger finished subscribing — check if we're reconnecting to an active game.
+                    // If game is already PLAYING, send RECONNECTED instead of AUTH_CHALLENGE
+                    // (prevents clearAll() wiping the in-progress board state).
+                    moduleScope.launch {
+                        val session = repo.getSession(gameId)
+                        if (session?.status == "PLAYING") {
+                            bleService?.broadcastControl(BleConstants.MSG_RECONNECTED)
+                        } else {
+                            val requiresPass = if (passKeyHash.isNotEmpty()) "1" else "0"
+                            bleService?.broadcastControl(
+                                "${BleConstants.MSG_AUTH_CHALLENGE}:${gameId}:${requiresPass}"
+                            )
+                        }
                     }
+                }
+                message == BleConstants.MSG_HEARTBEAT -> {
+                    // Watchdog is already reset in CaroBleService.onCharacteristicChanged
+                    // Nothing extra needed here
+                }
+                message == BleConstants.MSG_RECONNECTING -> {
+                    isReconnecting = true
+                    sendEvent("onReconnecting", "")
+                }
+                message == BleConstants.MSG_RECONNECTED -> {
+                    isReconnecting = false
+                    sendEvent("onReconnected", "")
+                    // Flush any moves queued while offline
+                    moduleScope.launch {
+                        val pending = repo.getPendingMoves()
+                        for (pm in pending) {
+                            val move = CaroMove(
+                                x = pm.x, y = pm.y,
+                                playerSymbol = pm.playerSymbol,
+                                moveNumber = repo.getMoveCount() + 1
+                            )
+                            bleService?.sendMoveToHost(move)
+                            repo.markMoveSynced(pm.id)
+                        }
+                    }
+                }
+                message == BleConstants.MSG_AUTH_OK -> {
+                    sendEvent("onAuthSuccess", "")
+                }
+                message == BleConstants.MSG_AUTH_FAIL -> {
+                    sendEvent("onAuthFail", "")
+                    bleService?.disconnectFromHost()
+                }
+                message.startsWith("${BleConstants.MSG_AUTH_CHALLENGE}:") -> {
+                    // Challenger received AUTH_CHALLENGE:gameId:requiresPass
+                    val parts = message.removePrefix("${BleConstants.MSG_AUTH_CHALLENGE}:").split(":")
+                    val challengeGameId = parts.getOrNull(0) ?: ""
+                    val requiresPass = parts.getOrNull(1) == "1"
+                    gameId = challengeGameId
+                    // Create DB session BEFORE sending event so UI reads correct state.
+                    // Safety guard: if already PLAYING with the same ID (stale reconnect message), skip clearAll.
+                    moduleScope.launch {
+                        val existing = repo.getSession(challengeGameId)
+                        if (existing?.status == "PLAYING" && challengeGameId == gameId) return@launch
+                        repo.clearAll()
+                        repo.createSession(challengeGameId, hostDeviceId)
+                        if (requiresPass) {
+                            sendEvent("onAuthRequired", challengeGameId)
+                        } else {
+                            sendEvent("onGameStateChange", Json.encodeToString(mapOf(
+                                "gameId" to challengeGameId
+                            )))
+                        }
+                    }
+                }
+                message.startsWith("${BleConstants.MSG_AUTH}:") -> {
+                    // Host received AUTH:hash from challenger
+                    val submittedHash = message.removePrefix("${BleConstants.MSG_AUTH}:")
+                    if (passKeyHash.isEmpty() || submittedHash == passKeyHash) {
+                        bleService?.broadcastControl(BleConstants.MSG_AUTH_OK)
+                    } else {
+                        bleService?.broadcastControl(BleConstants.MSG_AUTH_FAIL)
+                        // Disconnect the challenger after giving time for the message to arrive
+                        moduleScope.launch {
+                            delay(500)
+                            bleService?.disconnectChallenger()
+                        }
+                    }
+                }
+                message.startsWith("${BleConstants.MSG_PLAYER_READY}:") -> {
+                    // Host received PLAYER_READY:deviceId:deviceName from challenger
+                    val parts = message.removePrefix("${BleConstants.MSG_PLAYER_READY}:").split(":")
+                    challengerDeviceId = parts.getOrNull(0) ?: challengerDeviceId
+                    challengerDeviceName = parts.getOrNull(1) ?: challengerDeviceName
+                    challengerReady = true
+                    sendEvent("onPlayerReady", Json.encodeToString(mapOf(
+                        "deviceId" to challengerDeviceId,
+                        "deviceName" to challengerDeviceName
+                    )))
+                    sendEvent("onGameStateChange", Json.encodeToString(mapOf(
+                        "challengerDeviceId" to challengerDeviceId,
+                        "challengerDeviceName" to challengerDeviceName,
+                        "challengerReady" to true
+                    )))
+                }
+                message.startsWith("GAME_OVER:") -> {
+                    val winner = message.removePrefix("GAME_OVER:")
+                    bleService?.isGamePlaying = false
+                    bleService?.stopWatchdog()
+                    sendEvent("onGameOver", winner)
+                    sendEvent("onGameStateChange", Json.encodeToString(mapOf(
+                        "status" to "FINISHED",
+                        "winner" to winner
+                    )))
+                }
+                else -> {
+                    sendEvent("onGameOver", message)
                 }
             }
         }
@@ -409,6 +723,13 @@ class CaroGameModule(reactContext: ReactApplicationContext) :
         reactApplicationContext
             .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
             .emit(eventName, data)
+    }
+
+    // SHA-256 helper — returns lowercase hex string
+    private fun sha256(input: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val hash = digest.digest(input.toByteArray(Charsets.UTF_8))
+        return hash.joinToString("") { "%02x".format(it) }
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────

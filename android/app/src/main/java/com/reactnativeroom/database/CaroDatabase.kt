@@ -6,13 +6,14 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 
 @Database(
-    entities = [CaroMove::class, GameSession::class],
-    version = 1,
+    entities = [CaroMove::class, GameSession::class, PendingMove::class],
+    version = 2,
     exportSchema = true
 )
 abstract class CaroDatabase : RoomDatabase() {
 
     abstract fun caroDao(): CaroDao
+    abstract fun pendingMoveDao(): PendingMoveDao
 
     companion object {
         @Volatile
